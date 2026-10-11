@@ -36,6 +36,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.util.Collections;
@@ -529,10 +530,19 @@ public class VectorIndexTest {
                     dataset.newScan(new ScanOptions.Builder().nearest(query.build()).build());
                 ArrowReader reader = scanner.scanBatches()) {
               int rows = 0;
+              int correct = 0;
               while (reader.loadNextBatch()) {
                 rows += reader.getVectorSchemaRoot().getRowCount();
+                IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("i");
+                for (int i = 0; i < ids.getValueCount(); i++) {
+                  // Each of the five fragments has the same nearest vector at offset zero.
+                  if (ids.get(i) % 80 == 0) {
+                    correct++;
+                  }
+                }
               }
               assertEquals(5, rows);
+              assertTrue(correct / 5.0 >= 0.5, "Expected recall >= 0.5 for " + precision);
             }
           }
         }
