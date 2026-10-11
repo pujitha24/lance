@@ -1552,6 +1552,8 @@ impl Dataset {
                 ef,
                 query_parallelism,
                 approx_mode,
+                rq_precision,
+                rq_cascade_factor,
                 search_effort,
             ) = vector_query_params_from_dict(nearest, default_k)?;
 
@@ -1624,6 +1626,10 @@ impl Dataset {
                     }
                     s = s.query_parallelism(query_parallelism);
                     s = s.approx_mode(approx_mode);
+                    s.rq_precision(rq_precision);
+                    if let Some(factor) = rq_cascade_factor {
+                        s.rq_cascade_factor(factor)?;
+                    }
                     s = s.search_effort(search_effort)?;
                     s.use_index(use_index);
                     if let Some((lower, upper)) = distance_range {
@@ -5342,6 +5348,9 @@ fn prepare_vector_index_params(
         }
 
         // Parse PQ/RQ params
+        if let Some(value) = kwargs.get_item("layered")? {
+            rq_params.layered = value.extract()?;
+        }
         if let Some(n) = kwargs.get_item("num_bits")? {
             let num_bits: u8 = n.extract()?;
             pq_params.num_bits = num_bits as usize;
@@ -5735,6 +5744,8 @@ type VectorQueryParams = (
     Option<usize>,
     i32,
     ApproxMode,
+    lance_index::vector::bq::layered::RQPrecision,
+    Option<u32>,
     f64,
 );
 
@@ -5888,7 +5899,23 @@ fn vector_query_params_from_dict(
 
     let query_parallelism = vector_query_query_parallelism_from_dict(dict)?;
     let approx_mode = vector_query_approx_mode_from_dict(dict)?;
+    let rq_precision = dict
+        .get_item("rq_precision")?
+        .filter(|v| !v.is_none())
+        .map(|v| v.extract::<String>())
+        .transpose()?
+        .map(|v| {
+            v.parse::<lance_index::vector::bq::layered::RQPrecision>()
+                .map_err(|e| PyValueError::new_err(e.to_string()))
+        })
+        .transpose()?
+        .unwrap_or_default();
 
+    let rq_cascade_factor = dict
+        .get_item("rq_cascade_factor")?
+        .filter(|v| !v.is_none())
+        .map(|v| v.extract::<u32>())
+        .transpose()?;
     Ok((
         column,
         key,
@@ -5901,6 +5928,8 @@ fn vector_query_params_from_dict(
         ef,
         query_parallelism,
         approx_mode,
+        rq_precision,
+        rq_cascade_factor,
         search_effort,
     ))
 }
@@ -5939,6 +5968,8 @@ impl PySearchFilter {
             ef,
             query_parallelism,
             approx_mode,
+            rq_precision,
+            rq_cascade_factor,
             search_effort,
         ) = vector_query_params_from_dict(query, default_k)?;
 
@@ -5959,6 +5990,8 @@ impl PySearchFilter {
             query_parallelism,
             dist_q_c: 0.0,
             approx_mode,
+            rq_precision,
+            rq_cascade_factor,
             search_effort,
         };
         vector_query

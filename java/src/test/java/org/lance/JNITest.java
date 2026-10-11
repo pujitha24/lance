@@ -23,6 +23,7 @@ import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.ipc.ApproxMode;
 import org.lance.ipc.Query;
+import org.lance.ipc.RQPrecision;
 import org.lance.test.JniTestHelper;
 
 import org.junit.jupiter.api.Test;
@@ -56,6 +57,18 @@ public class JNITest {
     Query defaultQuery =
         new Query.Builder().setColumn("column").setKey(new float[] {1.0f, 2.0f, 3.0f}).build();
     assertEquals(ApproxMode.NORMAL, defaultQuery.getApproxMode());
+    assertEquals(RQPrecision.FULL, defaultQuery.getRqPrecision());
+    assertEquals(Optional.empty(), defaultQuery.getRqCascadeFactor());
+    for (RQPrecision precision : RQPrecision.values()) {
+      Query query =
+          new Query.Builder()
+              .setColumn("vector")
+              .setKey(new float[] {1.0f, 2.0f})
+              .setRqPrecision(precision)
+              .build();
+      assertEquals(precision.toRustString(), query.getRqPrecisionString());
+      JniTestHelper.parseQuery(Optional.of(query));
+    }
     assertEquals(0.5, defaultQuery.getSearchEffort());
     assertEquals(Optional.empty(), defaultQuery.getSearchEffortOption());
 
@@ -146,6 +159,8 @@ public class JNITest {
   @Test
   public void testRqBuildParamsDefaultNumBits() {
     assertEquals((byte) 5, new RQBuildParams.Builder().build().getNumBits());
+    assertEquals(false, new RQBuildParams.Builder().build().getLayered());
+    assertEquals(true, new RQBuildParams.Builder().setLayered(true).build().getLayered());
   }
 
   @Test
