@@ -987,7 +987,7 @@ mod tests {
     fn all_layouts() -> Vec<RabitQuantizationMetadata> {
         let mut layouts = Vec::new();
         for dim in [64, 128, 1024] {
-            for num_bits in [1, 5, 7, 9] {
+            for num_bits in [1, 3, 4, 5, 6, 7, 8, 9] {
                 for estimator in [
                     RabitQueryEstimator::RawQuery,
                     RabitQueryEstimator::ResidualQuery,
