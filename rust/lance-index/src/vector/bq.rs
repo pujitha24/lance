@@ -133,7 +133,7 @@ pub struct RQBuildParams {
     /// rotates vectors identically. This is transient build-time state and is never
     /// persisted to the `RabitQuantization` params proto.
     pub rotation: Option<RabitQuantizationMetadata>,
-    /// Store prefix code planes; supported for 5, 7 and 9 bits. Default off.
+    /// Store prefix code planes; supported for 3 through 9 bits. Default off.
     pub layered: bool,
     /// How the auxiliary file stores each row's fields. Default columns; the
     /// plane-row layout is committed as index version 3, which readers
