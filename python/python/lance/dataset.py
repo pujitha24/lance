@@ -4541,8 +4541,9 @@ class LanceDataset(pa.dataset.Dataset):
                 The number of bits for RQ (Rabit Quantization). Default is 5.
             - layered
                 Opt in to independently readable sign/high/low planes. Default is
-                False. Supported total widths are 5 (1+2+2), 7 (1+4+2), and 9
-                (1+4+4); this layout requires a layered-capable reader.
+                False. Supports total widths 3 through 9: 3 (1+1+1), 4 (1+2+1),
+                5 (1+2+2), 6 (1+4+1), 7 (1+4+2), 8 (1+4+3), and 9 (1+4+4).
+                This layout requires a layered-capable reader.
 
         Optional parameters for `IVF_HNSW_*`:
             max_level
@@ -7070,7 +7071,9 @@ class ScannerBuilder:
         if isinstance(filter, FullTextQuery):
             self._search_filter = PySearchFilter.from_full_text_query(filter.inner)
         elif isinstance(filter, VectorSearchQuery):
-            self._search_filter = PySearchFilter.from_vector_search_query(filter.inner)
+            self._search_filter = PySearchFilter.from_vector_search_query(
+                filter.inner()
+            )
         elif isinstance(filter, str):
             self._filter = filter
         elif isinstance(filter, pa.compute.Expression):
@@ -7207,6 +7210,7 @@ class ScannerBuilder:
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
+        search_effort: Optional[float] = None,
         rq_precision: Literal["sign", "high", "full"] = "full",
         rq_cascade_factor: Optional[int] = None,
     ) -> ScannerBuilder:
@@ -7231,6 +7235,15 @@ class ScannerBuilder:
             the CPU pool size. Value 1 uses the single-worker sequential path.
             Values >= 2 use the partition-parallel path and are clamped to the
             CPU pool size.
+        search_effort: float, optional
+            Initial IVF search budget, a finite value in [0, 1]. None resolves
+            to 0.5, preserving Auto. Zero starts at the caller minimum (at least one
+            available partition); one starts at all available partitions, subject
+            to maximum_nprobes. Intermediate values interpolate geometrically.
+            Later expansion to find enough candidates is unchanged. This is
+            independent of approx_mode, ef and refinement, and is not a recall
+            guarantee. When supplied, effort ignores nprobes, including an explicit
+            0.5. With None, an explicitly supplied nprobes remains effective.
         approx_mode: {"fast", "normal", "accurate"}, default "normal"
             Controls the speed / accuracy tradeoff for approximate vector search
             when supported by the selected index. This currently only affects
@@ -7241,8 +7254,9 @@ class ScannerBuilder:
             confidence policy in normal mode and a conservative estimator-difference
             pruning bound in accurate mode. Neither requires raw-vector refinement.
         rq_precision: {"sign", "high", "full"}, default "full"
-            Select a stored level of a layered IVF_RQ index. High uses 3 total
-            bits for RQ5 and 5 total bits for RQ7/RQ9. Non-layered indexes only
+            Select a stored level of a layered IVF_RQ index. High uses 2 total
+            bits for RQ3, 3 for RQ4/RQ5, and 5 for RQ6 through RQ9.
+            Non-layered indexes only
             support full. The legacy approx_mode="fast" still scores binary codes.
         rq_cascade_factor: int, optional
             Positive oversampling factor for quantized candidate reranking.
@@ -7267,6 +7281,7 @@ class ScannerBuilder:
             rq_precision=rq_precision,
             rq_cascade_factor=rq_cascade_factor,
             approx_mode=approx_mode,
+            search_effort=search_effort,
             distance_range=distance_range,
         )
         return self
@@ -8508,6 +8523,7 @@ def _build_vector_search_query(
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
     rq_precision: Literal["sign", "high", "full"] = "full",
     rq_cascade_factor: Optional[int] = None,
+    search_effort: Optional[float] = None,
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -8534,7 +8550,8 @@ def _build_vector_search_query(
     minimum_nprobes: int, optional
         The minimum number of partitions to search.
     maximum_nprobes: int, optional
-        The maximum number of partitions to search.
+        The maximum number of partitions to search per index segment. This bounds
+        both initial and later probing without disabling Auto probing.
     refine_factor: int, optional
         The refine factor for the search.
     use_index: bool, default True
@@ -8547,6 +8564,15 @@ def _build_vector_search_query(
         maps to the single-worker sequential path. Value -1 uses the CPU pool
         size. Value 1 uses the single-worker sequential path. Values >= 2 use
         the partition-parallel path and are clamped to the CPU pool size.
+    search_effort: float, optional
+        Initial IVF search budget, a finite value in [0, 1]. None resolves
+        to 0.5, preserving Auto. Zero starts at the caller minimum (at least one
+        available partition); one starts at all available partitions, subject
+        to maximum_nprobes. Intermediate values interpolate geometrically.
+        Later expansion to find enough candidates is unchanged. This is
+        independent of approx_mode, ef and refinement, and is not a recall
+        guarantee. When supplied, effort ignores nprobes, including an explicit
+        0.5. With None, an explicitly supplied nprobes remains effective.
     approx_mode: {"fast", "normal", "accurate"}, default "normal"
         Controls the speed / accuracy tradeoff for approximate vector search
         when supported by the selected index. This currently only affects
@@ -8567,33 +8593,34 @@ def _build_vector_search_query(
     """
     q, q_dim = _coerce_query_vector(q)
 
-    lance_field = dataset._ds.lance_schema.field_case_insensitive(column)
-    if lance_field is None:
-        raise ValueError(f"Embedding column {column} is not in the dataset")
+    if dataset is not None:
+        lance_field = dataset._ds.lance_schema.field_case_insensitive(column)
+        if lance_field is None:
+            raise ValueError(f"Embedding column {column} is not in the dataset")
 
-    column_field = lance_field.to_arrow()
-    column_type = column_field.type
-    if hasattr(column_type, "storage_type"):
-        column_type = column_type.storage_type
-    if pa.types.is_fixed_size_list(column_type):
-        dim = column_type.list_size
-    elif pa.types.is_list(column_type) and pa.types.is_fixed_size_list(
-        column_type.value_type
-    ):
-        dim = column_type.value_type.list_size
-    else:
-        raise TypeError(
-            f"Query column {column} must be a vector. Got {column_field.type}."
-        )
+        column_field = lance_field.to_arrow()
+        column_type = column_field.type
+        if hasattr(column_type, "storage_type"):
+            column_type = column_type.storage_type
+        if pa.types.is_fixed_size_list(column_type):
+            dim = column_type.list_size
+        elif pa.types.is_list(column_type) and pa.types.is_fixed_size_list(
+            column_type.value_type
+        ):
+            dim = column_type.value_type.list_size
+        else:
+            raise TypeError(
+                f"Query column {column} must be a vector. Got {column_field.type}."
+            )
 
-    if q_dim != dim:
-        raise ValueError(
-            f"Query vector size {len(q)} does not match index column size {dim}"
-        )
+        if q_dim != dim:
+            raise ValueError(
+                f"Query vector size {len(q)} does not match index column size {dim}"
+            )
 
     if k is not None and int(k) <= 0:
         raise ValueError(f"Nearest-K must be > 0 but got {k}")
-    if nprobes is not None and int(nprobes) <= 0:
+    if search_effort is None and nprobes is not None and int(nprobes) <= 0:
         raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
     if minimum_nprobes is not None and int(minimum_nprobes) < 0:
         raise ValueError(f"Minimum nprobes must be >= 0 but got {minimum_nprobes}")
@@ -8645,6 +8672,7 @@ def _build_vector_search_query(
         "approx_mode": approx_mode,
         "rq_precision": rq_precision,
         "rq_cascade_factor": rq_cascade_factor,
+        "search_effort": search_effort,
         "distance_range": distance_range,
     }
 
@@ -8786,6 +8814,13 @@ class VectorIndexReader:
 
 
 class VectorSearchQuery:
+    """Vector search parameters, including continuous ``search_effort`` in [0, 1].
+
+    Effort defaults to None, which resolves to 0.5 (Auto). Explicit effort
+    ignores nprobes. See :meth:`ScannerBuilder.nearest` for probe bounds and
+    other search parameters.
+    """
+
     _inner: dict
 
     def __init__(
@@ -8801,9 +8836,10 @@ class VectorSearchQuery:
         use_index: bool = True,
         ef: Optional[int] = None,
         query_parallelism: Optional[int] = None,
+        approx_mode: Literal["fast", "normal", "accurate"] = "normal",
+        search_effort: Optional[float] = None,
         rq_precision: Literal["sign", "high", "full"] = "full",
         rq_cascade_factor: Optional[int] = None,
-        approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -8820,6 +8856,7 @@ class VectorSearchQuery:
             rq_precision=rq_precision,
             rq_cascade_factor=rq_cascade_factor,
             approx_mode=approx_mode,
+            search_effort=search_effort,
         )
 
     def inner(self):

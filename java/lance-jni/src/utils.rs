@@ -319,7 +319,10 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             .get_string_from_method(&java_obj, "getRqPrecisionString")?
             .parse()?;
 
-        Ok(Query {
+        let search_effort = env
+            .call_method(&java_obj, "getSearchEffort", "()D", &[])?
+            .d()?;
+        let query = Query {
             column,
             key,
             k,
@@ -327,6 +330,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             upper_bound: None,
             minimum_nprobes,
             maximum_nprobes,
+            search_effort,
             ef,
             refine_factor,
             metric_type: distance_type,
@@ -336,7 +340,9 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             approx_mode,
             rq_precision,
             rq_cascade_factor: env.get_optional_u32_from_method(&java_obj, "getRqCascadeFactor")?,
-        })
+        };
+        query.validate_search_effort()?;
+        Ok(query)
     })?;
 
     Ok(query)

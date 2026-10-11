@@ -40,7 +40,7 @@ public class RQBuildParams {
       return this;
     }
 
-    /** Opt into prefix planes (5, 7 or 9 bits); requires a layered-capable reader. */
+    /** Opt into prefix planes (3 through 9 bits); requires a layered-capable reader. */
     public Builder setLayered(boolean layered) {
       this.layered = layered;
       return this;
