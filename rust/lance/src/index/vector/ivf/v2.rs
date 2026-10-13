@@ -100,6 +100,9 @@ use uuid::Uuid;
 
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for_stats};
 
+pub mod rabit_scan;
+
+use rabit_scan::{RabitScan, RabitScanContext, RabitScanFactory};
 pub mod row_layout;
 
 pub(crate) type RabitSearchCacheCell = Arc<Mutex<Option<Option<Arc<RabitSearchCache>>>>>;
@@ -1078,6 +1081,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
 /// [`IvfIndexState`]. The default declares nothing and charges no cache.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IvfOpenContext {
+    /// Session policy only; deliberately absent from cached index state.
+    pub(crate) rabit_scan_factory: Option<Arc<dyn RabitScanFactory>>,
     /// The origin latency class the session declares for the IVF_RQ indexes
     /// it opens (`Session::index_origin_latency`), `None` when it declares
     /// none; see [`IVFIndex::origin_latency_at_open`].
@@ -1174,10 +1179,10 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     prepared_partitions: Arc<PreparedPartitionTracker>,
     /// Whether the storage is a layered IVF_RQ index, fixed when opened.
     layered_rq: bool,
+    rabit_scan: Option<Arc<dyn RabitScan>>,
     /// Latency class of reads from the index's files, resolved when the
     /// index opens; the storage carries the same class.
     origin_latency: OriginLatencyClass,
-
     _marker: PhantomData<(S, Q)>,
 }
 
@@ -1649,7 +1654,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let io_parallelism = object_store.io_parallelism();
         let origin_latency =
             Self::origin_latency_at_open(&object_store, context.origin_latency_hint)?;
-
         let uuid_str = uuid.to_string();
         let aux_path = index_dir
             .clone()
@@ -1735,6 +1739,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             context.file_cache.as_ref(),
             context.resident_columns,
         )?;
+        let rabit_scan = if storage.is_layered_rq() {
+            context
+                .rabit_scan_factory
+                .as_ref()
+                .map(|factory| factory.create(&index_file, origin_latency))
+                .transpose()?
+        } else {
+            None
+        };
         let resident_store =
             Self::resident_store_at_open(resident_columns, &index_file, context).await?;
         let storage = storage
@@ -1774,7 +1787,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let read_projection = Self::read_projection(&index_reader)?;
         let layered_rq =
             Q::quantization_type() == QuantizationType::Rabit && storage.is_layered_rq();
-
         let storage = storage.with_sign_bounds(Self::sign_bounds_at_open(layered_rq)?);
         Ok(Self {
             uri: to_local_path(&uri),
@@ -1795,9 +1807,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             open_io_stats,
             prepared_partitions: Arc::default(),
             layered_rq,
-
+            rabit_scan,
             origin_latency,
-
             _marker: PhantomData,
         })
     }
@@ -1826,7 +1837,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let read_projection = Self::read_projection(&reader)?;
         let layered_rq =
             Q::quantization_type() == QuantizationType::Rabit && storage.is_layered_rq();
-
         let storage = storage.with_sign_bounds(Self::sign_bounds_at_open(layered_rq)?);
         Ok(Self {
             uri,
@@ -1850,9 +1860,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             open_io_stats: ScanStats::default(),
             prepared_partitions: Arc::default(),
             layered_rq,
-
+            rabit_scan: None,
             origin_latency,
-
             _marker: PhantomData,
         })
     }
@@ -3385,6 +3394,27 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
 
         if control.is_none() && S::supports_global_topk_heap() {
+            if let Some(strategy) = &self.rabit_scan {
+                let erased: Arc<dyn std::any::Any + Send + Sync> = self.clone();
+                if let Ok(index) = erased.downcast::<IVFIndex<FlatIndex, RabitQuantizer>>() {
+                    let context = Arc::new(RabitScanContext::new(
+                        index,
+                        raw_query_context.clone(),
+                        query.clone(),
+                        partitions.clone(),
+                        q_c_dists.clone(),
+                        start_idx..end_idx,
+                        pre_filter.clone(),
+                        metrics.clone(),
+                    ));
+                    if let Some(batch) = strategy.search(context).await? {
+                        return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                            VECTOR_RESULT_SCHEMA.clone(),
+                            stream::once(async move { Ok(batch) }),
+                        )));
+                    }
+                }
+            }
             let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
             {
                 let _wait_timer = IndexTimer::new(metrics.as_ref(), IndexTiming::PrefilterWait);
@@ -4093,6 +4123,15 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         context.resident_columns,
     )?;
     let io_stats = context.io_stats.clone();
+    let rabit_scan = if storage.is_layered_rq() {
+        context
+            .rabit_scan_factory
+            .as_ref()
+            .map(|factory| factory.create(&index_file, origin_latency))
+            .transpose()?
+    } else {
+        None
+    };
     let resident_columns =
         IVFIndex::<S, Q>::resident_store_at_open(resident, &index_file, context).await?;
     let storage = storage
@@ -4108,7 +4147,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
 
     let parsed_uuid = Uuid::parse_str(&state.uuid)
         .map_err(|e| Error::index(format!("Invalid UUID in IvfIndexState: {e}")))?;
-    let index = IVFIndex::<S, Q>::from_cached_state(
+    let mut index = IVFIndex::<S, Q>::from_cached_state(
         to_local_path(&index_path),
         index_path.to_string(),
         parsed_uuid,
@@ -4122,12 +4161,12 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         rq_search_cache,
         origin_latency,
     )?;
+    index.rabit_scan = rabit_scan;
     Ok(Arc::new(index))
 }
 
 #[cfg(test)]
 mod tests {
-    use lance_io::assert_io_eq;
     use std::collections::{HashMap, HashSet};
     use std::iter::repeat_n;
     use std::{
@@ -4207,6 +4246,7 @@ mod tests {
         storage::STORAGE_METADATA_KEY,
     };
     use lance_index::{INDEX_AUXILIARY_FILE_NAME, metrics::NoOpMetricsCollector};
+    use lance_io::assert_io_eq;
     use lance_io::{
         object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor},
         scheduler::{ScanScheduler, SchedulerConfig},
@@ -8322,13 +8362,13 @@ mod tests {
         test_remap(params, 4, 0.5).await;
     }
 
-    /// The lazy layered full-precision scan must return exactly the eager
-    /// scan's batch (row ids, distance bits and heap order) for every cache
-    /// state, filter, bound and scan setting.
+    /// Layered storage, cache lifetime and scan extension integration.
     mod layered_storage {
         use super::*;
         use crate::io::exec::utils::IndexMetrics;
+        use async_trait::async_trait;
         use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+        use lance_core::Error;
         use lance_index::metrics::MetricsCollector;
         use std::sync::LazyLock;
         use std::sync::atomic::AtomicU64;
@@ -8979,6 +9019,183 @@ mod tests {
                 .as_any()
                 .downcast_ref::<IvfRq>()
                 .expect("layered IVF_RQ index")
+        }
+
+        #[derive(Debug, Clone)]
+        struct RecordingScanFactory {
+            opens: Arc<AtomicUsize>,
+            searches: Arc<AtomicUsize>,
+            behavior: TestScanBehavior,
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum TestScanBehavior {
+            Full,
+            SearchError,
+            OpenError,
+        }
+
+        impl super::super::rabit_scan::RabitScanFactory for RecordingScanFactory {
+            fn create(
+                &self,
+                _file: &IndexFileKey,
+                _origin: OriginLatencyClass,
+            ) -> Result<Arc<dyn super::super::rabit_scan::RabitScan>> {
+                self.opens.fetch_add(1, Ordering::Relaxed);
+                if matches!(self.behavior, TestScanBehavior::OpenError) {
+                    return Err(Error::invalid_input("injected RaBitQ factory failure"));
+                }
+                Ok(Arc::new(self.clone()))
+            }
+        }
+
+        #[async_trait]
+        impl super::super::rabit_scan::RabitScan for RecordingScanFactory {
+            async fn search(
+                &self,
+                _context: Arc<super::super::rabit_scan::RabitScanContext>,
+            ) -> Result<Option<RecordBatch>> {
+                self.searches.fetch_add(1, Ordering::Relaxed);
+                if matches!(self.behavior, TestScanBehavior::SearchError) {
+                    Err(Error::internal("injected RaBitQ execution failure"))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+
+        #[rstest]
+        #[case::fallback(TestScanBehavior::Full)]
+        #[case::execution_error(TestScanBehavior::SearchError)]
+        #[case::open_error(TestScanBehavior::OpenError)]
+        #[tokio::test]
+        async fn test_rabit_scan_factory_rebinds_from_current_session(
+            #[case] behavior: TestScanBehavior,
+        ) {
+            let batch = gen_batch()
+                .with_seed(Seed::from(42))
+                .col(
+                    "vector",
+                    array::rand_vec::<Float32Type>(Dimension::from(32)),
+                )
+                .into_batch_rows(RowCount::from(256))
+                .unwrap();
+            let dir = TempStrDir::default();
+            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+            let mut dataset = Dataset::write(reader, dir.as_str(), None).await.unwrap();
+            let vectors = batch["vector"].as_fixed_size_list();
+            let centroids = Arc::new(vectors.slice(0, 4));
+            let params = VectorIndexParams::with_ivf_rq_params(
+                DistanceType::L2,
+                IvfBuildParams::try_with_centroids(4, centroids).unwrap(),
+                RQBuildParams::new(7).with_layered(true),
+            );
+            dataset
+                .create_index(&["vector"], IndexType::Vector, None, &params, true)
+                .await
+                .unwrap();
+            let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+            let query = lazy_test_query(vectors.value(0), 8, 4);
+            let truth =
+                super::ground_truth(&dataset, "vector", query.key.as_ref(), 8, DistanceType::L2)
+                    .await;
+            let backend = Arc::new(QuickCacheBackend::with_capacity(4 * 1024 * 1024));
+            let session = || {
+                Session::with_index_cache_backend(
+                    backend.clone(),
+                    LAZY_METADATA_CACHE_BYTES,
+                    Arc::default(),
+                )
+            };
+            let original = Arc::new(RecordingScanFactory {
+                opens: Arc::default(),
+                searches: Arc::default(),
+                behavior: TestScanBehavior::Full,
+            });
+            let installed = open_with_session(
+                dir.as_str(),
+                session().with_rabit_scan_factory(original.clone()),
+            )
+            .await;
+            let mut expected = None;
+            for opening in 1..=2 {
+                let index = installed
+                    .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                let result = search_global(&index, &query, Arc::new(NoFilter))
+                    .await
+                    .unwrap();
+                let actual = result_bits(&result);
+                assert_eq!(original.opens.load(Ordering::Relaxed), opening);
+                assert_eq!(original.searches.load(Ordering::Relaxed), opening);
+                assert!(
+                    actual.0.iter().filter(|row| truth.contains(row)).count() >= 4,
+                    "recall must be >= 0.5"
+                );
+                if let Some(expected) = &expected {
+                    assert_eq!(&actual, expected);
+                }
+                expected = Some(actual);
+            }
+            let expected = expected.unwrap();
+
+            // Sharing serialized file state never installs another session's strategy.
+            let ordinary = open_with_session(dir.as_str(), session()).await;
+            let index = ordinary
+                .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            assert!(lazy_index(&index).rabit_scan.is_none());
+            assert_eq!(
+                result_bits(
+                    &search_global(&index, &query, Arc::new(NoFilter))
+                        .await
+                        .unwrap()
+                ),
+                expected
+            );
+            assert_eq!(original.searches.load(Ordering::Relaxed), 2);
+
+            let replacement = Arc::new(RecordingScanFactory {
+                behavior,
+                opens: Arc::default(),
+                searches: Arc::default(),
+            });
+            let replaced = open_with_session(
+                dir.as_str(),
+                session().with_rabit_scan_factory(replacement.clone()),
+            )
+            .await;
+            let opened = replaced
+                .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+                .await;
+            assert_eq!(replacement.opens.load(Ordering::Relaxed), 1);
+            if matches!(behavior, TestScanBehavior::OpenError) {
+                let error = opened.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("injected RaBitQ factory failure")
+                );
+                return;
+            }
+            let result = search_global(&opened.unwrap(), &query, Arc::new(NoFilter)).await;
+            assert_eq!(replacement.searches.load(Ordering::Relaxed), 1);
+            match behavior {
+                TestScanBehavior::Full => assert_eq!(result_bits(&result.unwrap()), expected),
+                TestScanBehavior::SearchError => {
+                    let error = result.unwrap_err();
+                    assert!(matches!(error, Error::Internal { .. }), "{error}");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("injected RaBitQ execution failure")
+                    );
+                }
+                TestScanBehavior::OpenError => unreachable!(),
+            }
         }
 
         fn lazy_test_query(key: ArrayRef, k: usize, nprobes: usize) -> Query {
@@ -10270,7 +10487,6 @@ mod tests {
             let index = dataset
                 .open_vector_index("vector", uuid, &NoOpMetricsCollector)
                 .await?;
-
             search_global(&index, query, Arc::new(NoFilter)).await?;
             Ok(index)
         }
@@ -11226,6 +11442,7 @@ mod tests {
             let mut loaded_stores = Vec::new();
             for frag_reuse_uuid in [Uuid::new_v4(), Uuid::new_v4()] {
                 let context = IvfOpenContext {
+                    rabit_scan_factory: None,
                     origin_latency_hint: Some(OriginLatencyClass::High),
                     resident_columns: ResidentColumnsSetting::Auto,
                     file_cache: Some(test.file_cache()),

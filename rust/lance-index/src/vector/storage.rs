@@ -3452,12 +3452,9 @@ mod tests {
         spawn_prewarm_materialization,
     };
     use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
-
     use lance_core::Error;
-
     use lance_core::deepsize::DeepSizeOf;
     use lance_io::object_store::ObjectStore;
-
     use std::sync::Arc;
 
     #[tokio::test]
