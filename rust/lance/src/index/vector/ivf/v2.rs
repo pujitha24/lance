@@ -65,9 +65,9 @@ use lance_index::vector::quantizer::{
 };
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::storage::{
-    IndexFileKey, LayeredLazyConfig, OriginLatencyClass, PlaneAccessTracker, QueryResidual,
-    QueryScratch, QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext, ResidentAttach,
-    ResidentColumns, ResidentColumnsSetting, ResidentStoreSize, VectorStore, entry_columns_setting,
+    IndexFileKey, OriginLatencyClass, PlaneAccessTracker, QueryResidual, QueryScratch,
+    QueryScratchCapacity, QueryScratchPool, RabitRawQueryContext, ResidentAttach, ResidentColumns,
+    ResidentColumnsSetting, ResidentStoreSize, VectorStore, entry_columns_setting,
     origin_latency_setting, resident_columns_setting, resident_lifetime_setting,
     resident_store_fits, shares_resident_store, sign_bounds_setting,
 };
@@ -100,7 +100,6 @@ use uuid::Uuid;
 
 use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for_stats};
 
-mod lazy_full;
 pub mod row_layout;
 
 pub(crate) type RabitSearchCacheCell = Arc<Mutex<Option<Option<Arc<RabitSearchCache>>>>>;
@@ -220,13 +219,6 @@ pub(crate) const GLOBAL_TOPK_CHUNK_MAX_PARTITIONS: usize = 128;
 /// Largest global-top-k heap converted to the result batch on the async task
 /// instead of a `spawn_cpu` dispatch; see the use site for the rationale.
 const GLOBAL_TOPK_INLINE_HEAP_LEN: usize = 4096;
-
-/// Lazy layered full-precision scan settings from the `LANCE_RQ_LAZY_*`
-/// environment, read once per process. An invalid value fails opening a
-/// layered index rather than silently changing its scan; with the scan off
-/// only `LANCE_RQ_LAZY_FULL` itself is read.
-static LAYERED_LAZY_CONFIG: LazyLock<std::result::Result<LayeredLazyConfig, String>> =
-    LazyLock::new(|| LayeredLazyConfig::from_env().map_err(|err| err.to_string()));
 
 const IVF_PREWARM_WINDOW_SIZE_ENV: &str = "LANCE_IVF_PREWARM_WINDOW_SIZE_BYTES";
 /// Default encoded-byte target of one prewarm read window.
@@ -1182,20 +1174,9 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     prepared_partitions: Arc<PreparedPartitionTracker>,
     /// Whether the storage is a layered IVF_RQ index, fixed when opened.
     layered_rq: bool,
-    /// Lazy full-precision scan settings of a layered index; see
-    /// [`LayeredLazyConfig`]. Locked only to copy it once per query.
-    layered_lazy: Mutex<LayeredLazyConfig>,
     /// Latency class of reads from the index's files, resolved when the
     /// index opens; the storage carries the same class.
     origin_latency: OriginLatencyClass,
-    /// Block size of the object store the index's files are read from, the
-    /// gap within which reads merge requested ranges unless a lazy sparse
-    /// origin read sets its own; see [`Self::lazy_origin_gap_bytes`].
-    origin_block_size: u64,
-    /// Staging parallelism of the lazy scan when non-zero; see
-    /// `set_lazy_prepare_parallelism_for_test`.
-    #[cfg(test)]
-    lazy_prepare_parallelism_for_test: AtomicUsize,
 
     _marker: PhantomData<(S, Q)>,
 }
@@ -1668,7 +1649,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let io_parallelism = object_store.io_parallelism();
         let origin_latency =
             Self::origin_latency_at_open(&object_store, context.origin_latency_hint)?;
-        let origin_block_size = object_store.block_size() as u64;
+
         let uuid_str = uuid.to_string();
         let aux_path = index_dir
             .clone()
@@ -1793,7 +1774,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let read_projection = Self::read_projection(&index_reader)?;
         let layered_rq =
             Q::quantization_type() == QuantizationType::Rabit && storage.is_layered_rq();
-        let layered_lazy = Self::layered_lazy_config_at_open(layered_rq, origin_latency)?;
+
         let storage = storage.with_sign_bounds(Self::sign_bounds_at_open(layered_rq)?);
         Ok(Self {
             uri: to_local_path(&uri),
@@ -1814,11 +1795,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             open_io_stats,
             prepared_partitions: Arc::default(),
             layered_rq,
-            layered_lazy: Mutex::new(layered_lazy),
+
             origin_latency,
-            origin_block_size,
-            #[cfg(test)]
-            lazy_prepare_parallelism_for_test: AtomicUsize::new(0),
+
             _marker: PhantomData,
         })
     }
@@ -1839,7 +1818,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         io_parallelism: usize,
         rq_search_cache: Option<Arc<RabitSearchCache>>,
         origin_latency: OriginLatencyClass,
-        origin_block_size: u64,
     ) -> Result<Self> {
         let storage = storage.with_origin_latency(origin_latency);
         let scratch_pool = Arc::new(Self::query_scratch_pool(&ivf, &storage));
@@ -1848,7 +1826,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let read_projection = Self::read_projection(&reader)?;
         let layered_rq =
             Q::quantization_type() == QuantizationType::Rabit && storage.is_layered_rq();
-        let layered_lazy = Self::layered_lazy_config_at_open(layered_rq, origin_latency)?;
+
         let storage = storage.with_sign_bounds(Self::sign_bounds_at_open(layered_rq)?);
         Ok(Self {
             uri,
@@ -1872,11 +1850,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             open_io_stats: ScanStats::default(),
             prepared_partitions: Arc::default(),
             layered_rq,
-            layered_lazy: Mutex::new(layered_lazy),
+
             origin_latency,
-            origin_block_size,
-            #[cfg(test)]
-            lazy_prepare_parallelism_for_test: AtomicUsize::new(0),
+
             _marker: PhantomData,
         })
     }
@@ -1906,29 +1882,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         self.origin_latency
     }
 
-    /// The gap in bytes within which the lazy scan's sparse reads from the
-    /// index's files merge row runs into one request: the index's
-    /// `LANCE_RQ_LAZY_ORIGIN_GAP_BYTES` resolved for its origin latency class
-    /// and object store; see [`lance_index::vector::storage::LazyOriginGap`].
-    pub fn lazy_origin_gap_bytes(&self) -> u64 {
-        let origin_gap = self
-            .layered_lazy
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .origin_gap;
-        origin_gap.resolve(self.origin_latency, self.origin_block_size)
-    }
-
-    /// The index's lazy scan settings: `LANCE_RQ_LAZY_*` read when it
-    /// opened, with the background promotion policy resolved for its origin
-    /// latency class; see [`LayeredLazyConfig`].
-    pub fn layered_lazy_config(&self) -> LayeredLazyConfig {
-        *self
-            .layered_lazy
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-    }
-
     /// Replace the origin latency class resolved at open, and what the
     /// index resolves from it when it opens (the lazy scan settings), so
     /// tests can open both classes over one store in one process.
@@ -1937,10 +1890,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         mut self,
         origin_latency: OriginLatencyClass,
     ) -> Result<Self> {
-        let layered_lazy = Self::layered_lazy_config_at_open(self.layered_rq, origin_latency)?;
         self.origin_latency = origin_latency;
         self.storage = self.storage.with_origin_latency(origin_latency);
-        self.layered_lazy = Mutex::new(layered_lazy);
         Ok(self)
     }
 
@@ -2136,9 +2087,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         self.storage.sign_bounds()
     }
 
-    /// Whether the index is a layered IVF_RQ index, the only kind that reads
-    /// `LANCE_RQ_SIGN_BOUNDS` and `LANCE_RQ_LAZY_*`; any other index keeps
-    /// their defaults.
+    /// Whether the index uses the layered IVF_RQ storage layout.
     pub fn is_layered_rq(&self) -> bool {
         self.layered_rq
     }
@@ -3436,29 +3385,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
 
         if control.is_none() && S::supports_global_topk_heap() {
-            if let Some(config) = self.lazy_full_config(&query, raw_query_context.is_some()) {
-                if !self
-                    .all_ex_planes_resident(&partitions, start_idx..end_idx)
-                    .await
-                {
-                    let batch = Box::pin(self.clone().search_partitions_lazy_full(
-                        query,
-                        partitions,
-                        q_c_dists,
-                        start_idx..end_idx,
-                        pre_filter,
-                        metrics,
-                        raw_query_context,
-                        config,
-                    ))
-                    .await?;
-                    return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                        VECTOR_RESULT_SCHEMA.clone(),
-                        stream::once(async move { Ok(batch) }),
-                    )));
-                }
-                layered_stats::counters().lazy_all_resident_skips.incr();
-            }
             let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
             {
                 let _wait_timer = IndexTimer::new(metrics.as_ref(), IndexTiming::PrefilterWait);
@@ -4110,7 +4036,6 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     let io_parallelism = object_store.io_parallelism();
     let origin_latency =
         IVFIndex::<S, Q>::origin_latency_at_open(&object_store, context.origin_latency_hint)?;
-    let origin_block_size = object_store.block_size() as u64;
 
     let index_path = Path::parse(&state.index_file_path)
         .map_err(|e| Error::io(format!("invalid index path: {e}")))?;
@@ -4196,13 +4121,13 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         io_parallelism,
         rq_search_cache,
         origin_latency,
-        origin_block_size,
     )?;
     Ok(Arc::new(index))
 }
 
 #[cfg(test)]
 mod tests {
+    use lance_io::assert_io_eq;
     use std::collections::{HashMap, HashSet};
     use std::iter::repeat_n;
     use std::{
@@ -7857,7 +7782,6 @@ mod tests {
         };
         use lance_index::vector::ApproxMode;
         use lance_index::vector::bq::layered::{PlaneBatch, RQPrecision};
-        use lance_io::assert_io_eq;
         use lance_io::object_store::ObjectStoreRegistry;
 
         use crate::session::Session;
@@ -8401,7 +8325,7 @@ mod tests {
     /// The lazy layered full-precision scan must return exactly the eager
     /// scan's batch (row ids, distance bits and heap order) for every cache
     /// state, filter, bound and scan setting.
-    mod layered_lazy {
+    mod layered_storage {
         use super::*;
         use crate::io::exec::utils::IndexMetrics;
         use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -8420,29 +8344,24 @@ mod tests {
         use lance_encoding::decoder::FilterExpression;
         use lance_file::version::LanceFileVersion;
         use lance_file::writer::FileWriterOptions;
-        use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
         use lance_index::metrics::LocalMetricsCollector;
         use lance_index::vector::bq::layered::{
             EntryColumns, FULL_BOUNDS_COLUMN, PlaneBatch, RQPrecision, SIGN_BOUNDS_PLANE,
             SignBounds, plane_columns, plane_entry_columns,
         };
-        use lance_index::vector::bq::layered_stats::{self, LayeredLazyStats, RANK_BUCKETS};
+        use lance_index::vector::bq::layered_stats;
         use lance_index::vector::bq::partition_codes::{PartitionCodes, PartitionCodesKey};
-        use lance_index::vector::bq::storage::{
-            RABIT_CODE_COLUMN, RabitPruneStatsSnapshot, rabit_prune_stats_snapshot,
-        };
+        use lance_index::vector::bq::storage::RABIT_CODE_COLUMN;
         use lance_index::vector::storage::{
-            DenseGatherMode, DenseToEager, GatherPlan, HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES,
-            IndexFileKey, LayeredLazyConfig, LazyOriginGap, LazyPromotion, OriginLatencyClass,
-            PlaneSource, ResidentAttach, ResidentColumns, ResidentColumnsEntry, ResidentColumnsKey,
-            ResidentColumnsSetting, ResidentLifetime, ResidentStoreSize, ResidentStoreViews,
-            entry_columns_setting, origin_latency_setting, resident_columns_setting,
-            resident_lifetime_setting, resident_store_is_live, resident_store_views,
-            shares_resident_store, sign_bounds_setting,
+            GatherPlan, IndexFileKey, OriginLatencyClass, PlaneSource, ResidentAttach,
+            ResidentColumns, ResidentColumnsEntry, ResidentColumnsKey, ResidentColumnsSetting,
+            ResidentLifetime, ResidentStoreSize, ResidentStoreViews, entry_columns_setting,
+            origin_latency_setting, resident_columns_setting, resident_lifetime_setting,
+            resident_store_is_live, resident_store_views, shares_resident_store,
+            sign_bounds_setting,
         };
-        use lance_index::vector::{ApproxMode, PartitionSearchControl, VECTOR_RESULT_SCHEMA};
+        use lance_index::vector::{ApproxMode, VECTOR_RESULT_SCHEMA};
         use lance_io::ReadBatchParams;
-        use lance_io::assert_io_eq;
         use lance_io::object_store::ObjectStoreRegistry;
         use lance_io::scheduler::IoStats;
         use rand::seq::SliceRandom;
@@ -8468,8 +8387,6 @@ mod tests {
         ];
         /// About a tenth of the index's plane bytes, so plane entries churn.
         const LAZY_SMALL_CACHE_BYTES: usize = 512 * 1024;
-        /// A few plane entries, so nearly every plane a query reads is admitted anew.
-        const LAZY_TINY_CACHE_BYTES: usize = 64 * 1024;
         const LAZY_LARGE_CACHE_BYTES: usize = 256 * 1024 * 1024;
         const LAZY_METADATA_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -8582,10 +8499,6 @@ mod tests {
                 }
             }
 
-            fn set_row_read_delay(&self, delay: Duration) {
-                *self.row_read_delay.lock().unwrap() = delay;
-            }
-
             fn record_plane_loads(&self) {
                 *self.plane_loads.lock().unwrap() = Some(Vec::new());
             }
@@ -8633,10 +8546,6 @@ mod tests {
                     let _ = spill.send(()).await;
                 }
                 Ok(admitted)
-            }
-
-            fn set_spill(&self, spill: Option<tokio::sync::mpsc::Sender<()>>) {
-                *self.spill.lock().unwrap() = spill;
             }
 
             fn persist(
@@ -8843,39 +8752,6 @@ mod tests {
             }
         }
 
-        /// A prefilter whose scalar-index load failed.
-        struct FailingFilter;
-
-        #[async_trait::async_trait]
-        impl PreFilter for FailingFilter {
-            async fn wait_for_ready(&self) -> Result<()> {
-                Err(lance_core::Error::internal("prefilter failed to load"))
-            }
-
-            fn is_empty(&self) -> bool {
-                false
-            }
-
-            fn mask(&self) -> Arc<RowAddrMask> {
-                Arc::new(RowAddrMask::all_rows())
-            }
-
-            fn filter_row_ids<'a>(
-                &self,
-                row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>,
-            ) -> Vec<u64> {
-                row_ids.copied().collect()
-            }
-        }
-
-        struct NeverStop;
-
-        impl PartitionSearchControl for NeverStop {
-            fn should_stop(&self) -> bool {
-                false
-            }
-        }
-
         fn lazy_test_filters() -> Vec<(&'static str, Arc<dyn PreFilter>)> {
             let rows = |keep: fn(u64) -> bool| -> RowAddrTreeMap {
                 (0..LAZY_ROWS as u64)
@@ -8914,159 +8790,6 @@ mod tests {
                 ),
                 ("collapse", filter(RowAddrMask::all_rows(), true)),
             ]
-        }
-
-        /// Lazy settings the parity tests rotate through, each with the origin
-        /// latency class of the index it runs on. On a low-latency origin the
-        /// default dense-to-eager routing (`origin`) routes no probe, so some
-        /// settings route every predicted-dense probe (`all`), and the far
-        /// window never applies. Promotions are off unless set, so some
-        /// settings that gather sparse rows promote a plane after one read.
-        /// Thresholds are published once a probe is scored whole unless set,
-        /// so some settings publish one as soon as a lazy probe's survivors
-        /// fill the heap, partway through scoring it.
-        /// The count of settings is prime, so over the parity test's cases
-        /// the rotation pairs every setting with every `k`, filter,
-        /// approximation mode and bounds choice.
-        fn lazy_test_configs() -> Vec<(OriginLatencyClass, LayeredLazyConfig)> {
-            let enabled = LayeredLazyConfig {
-                enabled: true,
-                ..Default::default()
-            };
-            let promote_once = LazyPromotion::Background { reads: 1 };
-            let low = [
-                // The cost policy's defaults, whose sparse gathers promote.
-                LayeredLazyConfig {
-                    promote: promote_once,
-                    ..enabled
-                },
-                // Sparse origin reads merge every run of a plane's column page.
-                LayeredLazyConfig {
-                    window: 0,
-                    dense: DenseGatherMode::Sparse,
-                    promote: LazyPromotion::Off,
-                    inline_rows: 0,
-                    origin_gap: LazyOriginGap::Bytes(u64::MAX),
-                    ..enabled
-                },
-                // Whole gathers predict every probe dense, which would
-                // otherwise send every probe to the eager scan.
-                LayeredLazyConfig {
-                    window: 1,
-                    dense: DenseGatherMode::Whole,
-                    promote: LazyPromotion::Background { reads: 2 },
-                    inline_rows: usize::MAX,
-                    dense_to_eager: DenseToEager::Off,
-                    ..enabled
-                },
-                LayeredLazyConfig {
-                    window: 8,
-                    max_runs: 0,
-                    dense_bytes_fraction: 0.1,
-                    dense_to_eager: DenseToEager::All,
-                    ..enabled
-                },
-                // Sparse origin reads merge only touching runs.
-                LayeredLazyConfig {
-                    window: 64,
-                    max_runs: 2,
-                    promote: LazyPromotion::Off,
-                    inline_rows: 0,
-                    origin_gap: LazyOriginGap::Bytes(0),
-                    ..enabled
-                },
-                // Every gather is sparse, and promotes.
-                LayeredLazyConfig {
-                    max_runs: usize::MAX,
-                    dense_bytes_fraction: f64::INFINITY,
-                    dense_to_eager: DenseToEager::All,
-                    promote: promote_once,
-                    ..enabled
-                },
-                LayeredLazyConfig {
-                    window: 4,
-                    eager_before_full: false,
-                    dense_to_eager: DenseToEager::All,
-                    ..enabled
-                },
-                // Sparse gathers, which promote the planes they read.
-                LayeredLazyConfig {
-                    dense: DenseGatherMode::Sparse,
-                    origin_max_runs: 0,
-                    promote: promote_once,
-                    ..enabled
-                },
-                LayeredLazyConfig {
-                    dense_to_eager: DenseToEager::Off,
-                    ..enabled
-                },
-                // The first probe stays lazy, and its survivors filling the
-                // heap publish the threshold before it is scored whole.
-                LayeredLazyConfig {
-                    dense_to_eager: DenseToEager::Off,
-                    partial_publish: true,
-                    ..enabled
-                },
-                // Gathers wait for the heap to fill, which a lazy probe
-                // publishes partway through its scoring.
-                LayeredLazyConfig {
-                    window: 4,
-                    eager_before_full: false,
-                    partial_publish: true,
-                    ..enabled
-                },
-            ];
-            // On a high-latency origin a probe whose high or low plane no
-            // cache tier holds is gathered within the far window.
-            let high = [
-                // The defaults: a far window of 64 probes with 64 permits,
-                // and predicted-dense probes on the slow origin routed to the
-                // eager scan.
-                enabled,
-                // Far gathers one at a time, beyond a window of one probe.
-                LayeredLazyConfig {
-                    window: 1,
-                    far_window: LAZY_PARTITIONS,
-                    far_inflight: 1,
-                    ..enabled
-                },
-                // Far gathers as soon as the heap fills, beyond no window.
-                LayeredLazyConfig {
-                    window: 0,
-                    eager_before_full: false,
-                    dense_to_eager: DenseToEager::Off,
-                    far_window: usize::MAX,
-                    ..enabled
-                },
-                // The defaults with promotions after one sparse read: the far
-                // window and the wide origin gap while promotions run.
-                LayeredLazyConfig {
-                    promote: promote_once,
-                    ..enabled
-                },
-                // The defaults with mid-probe publishes.
-                LayeredLazyConfig {
-                    partial_publish: true,
-                    ..enabled
-                },
-                // Far gathers released by a mid-probe publish once the heap
-                // fills, beyond no window.
-                LayeredLazyConfig {
-                    window: 0,
-                    eager_before_full: false,
-                    dense_to_eager: DenseToEager::Off,
-                    far_window: usize::MAX,
-                    partial_publish: true,
-                    ..enabled
-                },
-            ];
-            let low = low
-                .into_iter()
-                .map(|config| (OriginLatencyClass::Low, config));
-            let high = high
-                .into_iter()
-                .map(|config| (OriginLatencyClass::High, config));
-            low.chain(high).collect()
         }
 
         /// Clustered vectors around seeded centroids, in shuffled row order,
@@ -9167,13 +8890,8 @@ mod tests {
             Resident,
             /// A tiered backend without sign gating, prewarmed to disk.
             Ungated,
-            /// A tiered backend with sign gating at about a tenth of the planes.
-            Gated,
             /// A tiered backend without sign gating that holds every plane.
             TieredResident,
-            /// A tiered backend without sign gating whose RAM holds only a
-            /// few planes, prewarmed to disk.
-            Tiny,
             /// An empty tiered backend without sign gating that can hold every plane.
             ColdUngated,
             /// An empty tiered backend with sign gating that can hold every plane.
@@ -9227,18 +8945,14 @@ mod tests {
                     None,
                 ),
                 LazyTestCache::Ungated
-                | LazyTestCache::Gated
                 | LazyTestCache::TieredResident
-                | LazyTestCache::Tiny
                 | LazyTestCache::ColdUngated
                 | LazyTestCache::ColdGated => {
                     let (ram_bytes, gated) = match cache {
-                        LazyTestCache::Gated => (LAZY_SMALL_CACHE_BYTES, true),
                         LazyTestCache::TieredResident | LazyTestCache::ColdUngated => {
                             (LAZY_LARGE_CACHE_BYTES, false)
                         }
                         LazyTestCache::ColdGated => (LAZY_LARGE_CACHE_BYTES, true),
-                        LazyTestCache::Tiny => (LAZY_TINY_CACHE_BYTES, false),
                         _ => (LAZY_SMALL_CACHE_BYTES, false),
                     };
                     let backend = Arc::new(TieredPlaneTestBackend::new(ram_bytes, gated));
@@ -9327,356 +9041,6 @@ mod tests {
             )
         }
 
-        fn prune_delta(
-            after: RabitPruneStatsSnapshot,
-            before: RabitPruneStatsSnapshot,
-        ) -> [u64; 7] {
-            [
-                after.calls - before.calls,
-                after.candidates - before.candidates,
-                after.pruned_upper_bound - before.pruned_upper_bound,
-                after.pruned_heap - before.pruned_heap,
-                after.exact - before.exact,
-                after.exact_rejected - before.exact_rejected,
-                after.bypass_calls - before.bypass_calls,
-            ]
-        }
-
-        /// Run `query` eagerly and with `config`, assert identical batches and
-        /// (when `LANCE_RQ_PRUNE_STATS` is on) identical prune counters, and
-        /// return the lazy run's counters.
-        async fn assert_lazy_matches_eager(
-            index: &Arc<dyn VectorIndex>,
-            query: &Query,
-            filter: &Arc<dyn PreFilter>,
-            config: LayeredLazyConfig,
-            context: &str,
-        ) -> LayeredLazyStats {
-            let ivf = lazy_index(index);
-            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-            let before = rabit_prune_stats_snapshot();
-            let eager = search_global(index, query, filter.clone()).await.unwrap();
-            let after_eager = rabit_prune_stats_snapshot();
-            layered_stats::snapshot_and_reset();
-            ivf.set_layered_lazy_config_for_test(config);
-            let lazy = search_global(index, query, filter.clone()).await.unwrap();
-            let after_lazy = rabit_prune_stats_snapshot();
-            let stats = layered_stats::snapshot_and_reset();
-            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-            assert_eq!(result_bits(&lazy), result_bits(&eager), "{context}");
-            if before.enabled {
-                assert_eq!(
-                    prune_delta(after_lazy, after_eager),
-                    prune_delta(after_eager, before),
-                    "prune counters: {context}"
-                );
-            }
-            assert_eq!(stats.needed_not_fetched, 0, "{context}");
-            assert_lazy_chain_timing(&stats, context);
-            assert_partial_publish_counts(&stats, config, context);
-            stats
-        }
-
-        /// Check the mid-probe publish counters of `stats`, taken over lazy
-        /// scans under `config`. A scan's heap fills once, so it publishes a
-        /// mid-probe threshold at most once, and never with partial
-        /// publishes off; the gathers that take one are among the gathers,
-        /// never the first probe's, which is issued before its scoring.
-        fn assert_partial_publish_counts(
-            stats: &LayeredLazyStats,
-            config: LayeredLazyConfig,
-            context: &str,
-        ) {
-            let publishes: u64 = stats.mid_probe_full_publishes.iter().sum();
-            let issues: u64 = stats.partial_threshold_issues.iter().sum();
-            assert!(publishes <= stats.lazy_queries, "{stats:?} {context}");
-            if !config.partial_publish {
-                assert_eq!(
-                    (
-                        publishes,
-                        issues,
-                        stats.partial_threshold_rows.iter().sum::<u64>()
-                    ),
-                    (0, 0, 0),
-                    "{context}"
-                );
-            }
-            if publishes == 0 {
-                assert_eq!(issues, 0, "{stats:?} {context}");
-            }
-            assert_eq!(stats.partial_threshold_issues[0], 0, "{context}");
-            for bucket in 0..RANK_BUCKETS {
-                assert!(
-                    stats.partial_threshold_issues[bucket] <= stats.lazy_probes[bucket]
-                        && stats.partial_threshold_rows[bucket] <= stats.rows_fetched[bucket],
-                    "bucket {bucket}: {stats:?} {context}"
-                );
-            }
-        }
-
-        /// Check the release-chain timings of `stats`, taken over lazy scans
-        /// that all completed. An eager scan times nothing; every lazy scan
-        /// times its first probe's scoring once; a wait is timed only when it
-        /// is counted, and the waits of a gather are part of its gate wait.
-        /// Within one scan, the first probe's scoring is published no later
-        /// than the heap first fills, and when a gather waited for the
-        /// threshold or its turn, no gather that waits on scoring was issued
-        /// before that publish.
-        fn assert_lazy_chain_timing(stats: &LayeredLazyStats, context: &str) {
-            let timings = [
-                (
-                    "rank 0 scored",
-                    stats.lazy_rank0_scored_queries,
-                    stats.lazy_rank0_scored_ns,
-                ),
-                (
-                    "first gather issue",
-                    stats.lazy_first_gather_issue_queries,
-                    stats.lazy_first_gather_issue_ns,
-                ),
-                (
-                    "window wait",
-                    stats.lazy_window_waits,
-                    stats.lazy_window_wait_ns,
-                ),
-                (
-                    "release wait",
-                    stats.deferred_issues,
-                    stats.lazy_release_wait_ns,
-                ),
-                (
-                    "far permit wait",
-                    stats.far_permit_waits,
-                    stats.far_permit_wait_ns,
-                ),
-            ];
-            for (timing, count, ns) in timings {
-                if stats.lazy_queries == 0 {
-                    assert_eq!((count, ns), (0, 0), "{timing}: {context}");
-                }
-                if count == 0 {
-                    assert_eq!(ns, 0, "{timing}: {context}");
-                }
-            }
-            assert_eq!(
-                stats.lazy_rank0_scored_queries, stats.lazy_queries,
-                "{context}"
-            );
-            assert!(
-                stats.lazy_first_gather_issue_queries <= stats.lazy_queries,
-                "{context}"
-            );
-            let waits =
-                stats.lazy_window_wait_ns + stats.lazy_release_wait_ns + stats.far_permit_wait_ns;
-            assert!(
-                waits <= stats.gate_wait_ns,
-                "waits {waits} ns beyond the gate wait {} ns: {context}",
-                stats.gate_wait_ns
-            );
-            if stats.lazy_queries == 1 {
-                if stats.time_to_first_full_ns > 0 {
-                    assert!(
-                        stats.lazy_rank0_scored_ns <= stats.time_to_first_full_ns,
-                        "{stats:?} {context}"
-                    );
-                }
-                if stats.deferred_issues > 0 {
-                    assert_eq!(stats.lazy_first_gather_issue_queries, 1, "{context}");
-                    assert!(
-                        stats.lazy_rank0_scored_ns <= stats.lazy_first_gather_issue_ns,
-                        "{stats:?} {context}"
-                    );
-                }
-            }
-        }
-
-        /// Deltas of the promotion gauge are not reset by snapshots; wait
-        /// until background promotions have finished.
-        async fn wait_for_promotions() {
-            for _ in 0..500 {
-                if layered_stats::promotions_in_flight() == 0 {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            panic!(
-                "{} lazy promotions still running",
-                layered_stats::promotions_in_flight()
-            );
-        }
-
-        fn with_bounds(query: &Query, eager: &RecordBatch) -> Option<Query> {
-            let mut dists = eager[DIST_COL]
-                .as_primitive::<Float32Type>()
-                .values()
-                .to_vec();
-            if dists.len() < 4 {
-                return None;
-            }
-            dists.sort_by(f32::total_cmp);
-            let mut bounded = query.clone();
-            bounded.lower_bound = Some(dists[dists.len() / 10]);
-            bounded.upper_bound = Some(dists[dists.len() * 3 / 5]);
-            Some(bounded)
-        }
-
-        #[rstest]
-        #[case::rq5_l2(5, DistanceType::L2)]
-        #[case::rq7_l2(7, DistanceType::L2)]
-        #[case::rq9_l2(9, DistanceType::L2)]
-        #[case::rq7_cosine(7, DistanceType::Cosine)]
-        #[case::rq7_dot(7, DistanceType::Dot)]
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_full_matches_eager(
-            #[case] bits: u8,
-            #[case] distance_type: DistanceType,
-        ) {
-            const STAGING_STEPS: usize = 8;
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), bits, distance_type).await;
-            let vectors = batch["vector"].as_fixed_size_list();
-            let mut rng = StdRng::seed_from_u64(u64::from(bits));
-            let random: ArrayRef = Arc::new(Float32Array::from_iter_values(
-                (0..LAZY_DIM).map(|_| rng.random_range(-1.0f32..1.0)),
-            ));
-            let keys = [vectors.value(0), vectors.value(777), random];
-            let filters = lazy_test_filters();
-            let configs = lazy_test_configs();
-            let mut case = 0usize;
-            // Single scans in which a gather waited for the threshold or its
-            // turn, whose release chain `assert_lazy_chain_timing` orders.
-            let mut deferred_scans = 0usize;
-            let mut count_deferred = |stats: &LayeredLazyStats| {
-                deferred_scans += usize::from(stats.lazy_queries == 1 && stats.deferred_issues > 0);
-            };
-            for cache in [
-                LazyTestCache::Origin,
-                LazyTestCache::Small,
-                LazyTestCache::Resident,
-                LazyTestCache::Ungated,
-            ] {
-                let (dataset, opened, _) = open_lazy_test_index(dir.as_str(), cache).await;
-                let lengths = &lazy_index(&opened).storage.ivf().lengths;
-                assert!(lengths.contains(&0), "the fixture needs an empty partition");
-                assert!(
-                    lengths.iter().any(|&rows| rows > 0 && rows < 32),
-                    "the fixture needs a partition below one FastScan block"
-                );
-                // Each setting runs on an index pinned to its origin latency
-                // class, over the caches the dataset's index warmed.
-                let (store, index_dir) = index_files(&dataset).await;
-                let open = |class| {
-                    open_with_origin_latency(&dataset, store.clone(), index_dir.clone(), class)
-                };
-                let low = open(OriginLatencyClass::Low).await;
-                let high = open(OriginLatencyClass::High).await;
-                // Without a cache every plane of the high-latency twin is on
-                // the slow origin, so its gathers may run ahead of scoring
-                // within the far window. Staging several probes at once,
-                // whatever the host's cores, makes some do so, as asserted
-                // below.
-                let origin_far = cache == LazyTestCache::Origin;
-                if origin_far {
-                    lazy_index(&high).set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
-                }
-                let mut far_early_issues = 0;
-                let pinned = |class: OriginLatencyClass| match class {
-                    OriginLatencyClass::Low => &low,
-                    OriginLatencyClass::High => &high,
-                };
-                for key in &keys {
-                    for nprobes in [1, 4, LAZY_PARTITIONS] {
-                        for k in [1, 10, 100, 5000, LAZY_ROWS + 1] {
-                            case += 1;
-                            let (filter_name, filter) = &filters[case % filters.len()];
-                            let (class, config) = configs[case % configs.len()];
-                            let index = pinned(class);
-                            let mut query = lazy_test_query(key.clone(), k, nprobes);
-                            if case.is_multiple_of(3) {
-                                query.approx_mode = ApproxMode::Accurate;
-                            }
-                            let context = format!(
-                                "bits={bits} {distance_type:?} cache={cache:?} nprobes={nprobes} k={k} approx={:?} filter={filter_name} class={class} config={config:?}",
-                                query.approx_mode
-                            );
-                            let stats =
-                                assert_lazy_matches_eager(index, &query, filter, config, &context)
-                                    .await;
-                            count_deferred(&stats);
-                            match cache {
-                                LazyTestCache::Resident => {
-                                    assert_eq!(stats.lazy_all_resident_skips, 1, "{context}");
-                                    assert_eq!(stats.lazy_queries, 0, "{context}");
-                                }
-                                LazyTestCache::Origin => {
-                                    assert_eq!(stats.lazy_queries, 1, "{context}");
-                                }
-                                LazyTestCache::Ungated => {
-                                    assert_eq!(stats.origin_row_reads, 0, "{context}");
-                                }
-                                LazyTestCache::Small
-                                | LazyTestCache::Gated
-                                | LazyTestCache::TieredResident
-                                | LazyTestCache::Tiny
-                                | LazyTestCache::ColdUngated
-                                | LazyTestCache::ColdGated => {}
-                            }
-                            if class == OriginLatencyClass::High {
-                                far_early_issues += stats.far_early_issues;
-                            }
-                            if case % 2 == 1 {
-                                let eager =
-                                    search_global(index, &query, filter.clone()).await.unwrap();
-                                if let Some(bounded) = with_bounds(&query, &eager) {
-                                    let stats = assert_lazy_matches_eager(
-                                        index,
-                                        &bounded,
-                                        filter,
-                                        config,
-                                        &format!("{context} bounds"),
-                                    )
-                                    .await;
-                                    count_deferred(&stats);
-                                    if class == OriginLatencyClass::High {
-                                        far_early_issues += stats.far_early_issues;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // Every setting against every filter on the widest probe set.
-                let query = lazy_test_query(keys[0].clone(), 100, LAZY_PARTITIONS);
-                for &(class, config) in &configs {
-                    let index = pinned(class);
-                    for (filter_name, filter) in &filters {
-                        let context = format!(
-                            "bits={bits} {distance_type:?} cache={cache:?} filter={filter_name} class={class} config={config:?}"
-                        );
-                        let stats =
-                            assert_lazy_matches_eager(index, &query, filter, config, &context)
-                                .await;
-                        count_deferred(&stats);
-                        if class == OriginLatencyClass::High {
-                            far_early_issues += stats.far_early_issues;
-                        }
-                    }
-                }
-                if origin_far {
-                    assert!(
-                        far_early_issues > 0,
-                        "bits={bits} {distance_type:?}: no gather ran ahead of scoring on the high-latency origin"
-                    );
-                }
-                wait_for_promotions().await;
-            }
-            assert!(
-                deferred_scans > 0,
-                "bits={bits} {distance_type:?}: no scan deferred a gather, so no release chain was ordered"
-            );
-        }
-
         /// A plane-row copy of the fixture answers every query, precision,
         /// filter, cache and origin class as the column layout does, bit for
         /// bit: eager, with a cascade, and lazily under every scan setting
@@ -9712,7 +9076,6 @@ mod tests {
             let vectors = batch["vector"].as_fixed_size_list();
             let keys = [vectors.value(0), vectors.value(777)];
             let filters = lazy_test_filters();
-            let configs = lazy_test_configs();
             let precisions: &[RQPrecision] = if layered {
                 &[RQPrecision::Full, RQPrecision::High, RQPrecision::Sign]
             } else {
@@ -9784,32 +9147,6 @@ mod tests {
                             }
                         }
                     }
-                    if !layered {
-                        continue;
-                    }
-                    // Every lazy setting of the class on the widest probe set.
-                    let query = lazy_test_query(keys[0].clone(), 100, LAZY_PARTITIONS);
-                    let eager = result_bits(
-                        &search_global(&column, &query, filters[0].1.clone())
-                            .await
-                            .unwrap(),
-                    );
-                    for &(config_class, config) in &configs {
-                        if config_class != class {
-                            continue;
-                        }
-                        let context = format!("cache={cache:?} class={class} config={config:?}");
-                        assert_lazy_matches_eager(&row, &query, &filters[0].1, config, &context)
-                            .await;
-                        lazy_index(&row).set_layered_lazy_config_for_test(config);
-                        let lazy = search_global(&row, &query, filters[0].1.clone())
-                            .await
-                            .unwrap();
-                        lazy_index(&row)
-                            .set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-                        assert_eq!(result_bits(&lazy), eager, "{context}");
-                    }
-                    wait_for_promotions().await;
                 }
             }
         }
@@ -9825,213 +9162,6 @@ mod tests {
                     std::fs::copy(entry.path(), target).unwrap();
                 }
             }
-        }
-
-        /// An ungated backend is warmed partition by partition, so every plane
-        /// is persisted even when RAM holds only part of the sign planes, and
-        /// warm queries read nothing from the origin file, whether the first
-        /// probe (the only one this query gathers rows of: its threshold is
-        /// +inf) is gathered sparsely, as the sparse gather policy always
-        /// does, or loaded by the eager scan, as the cost policy routes it
-        /// when every predicted-dense probe is routed.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_ungated_prewarm_persists_every_plane() {
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (dataset, index, tiered) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::Ungated).await;
-            let tiered = tiered.unwrap();
-            assert_eq!(
-                tiered.persisted_entries(<PlaneBatch as CacheCodecImpl>::TYPE_ID),
-                3 * LAZY_PARTITIONS
-            );
-            let key = batch["vector"].as_fixed_size_list().value(5);
-            let query = lazy_test_query(key, 100, LAZY_PARTITIONS);
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            search_global(&index, &query, filter.clone()).await.unwrap();
-            // The sparse run goes first: the routed eager load admits the
-            // first probe's planes, after which it would gather nothing.
-            for dense in [DenseGatherMode::Sparse, DenseGatherMode::Cost] {
-                let context = format!("ungated prewarm dense={dense:?}");
-                dataset.object_store.as_ref().io_stats_incremental();
-                let stats = assert_lazy_matches_eager(
-                    &index,
-                    &query,
-                    &filter,
-                    LayeredLazyConfig {
-                        enabled: true,
-                        dense,
-                        promote: LazyPromotion::Off,
-                        dense_to_eager: DenseToEager::All,
-                        ..Default::default()
-                    },
-                    &context,
-                )
-                .await;
-                let io = dataset.object_store.as_ref().io_stats_incremental();
-                assert_io_eq!(
-                    io,
-                    read_iops,
-                    0,
-                    "warm layered queries read no origin plane: {context}"
-                );
-                assert_eq!(stats.origin_row_reads, 0, "{context}");
-                let sparse_planes: u64 = stats.high_sparse.iter().chain(&stats.low_sparse).sum();
-                let eager_loads: u64 = stats.dense_to_eager.iter().sum();
-                if dense == DenseGatherMode::Sparse {
-                    assert!(eager_loads == 0 && sparse_planes > 0, "{context} {stats:?}");
-                } else {
-                    assert!(eager_loads > 0, "{context} {stats:?}");
-                }
-            }
-        }
-
-        /// Queries the lazy scan cannot serve run the eager scan and are
-        /// counted by reason.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_ineligible_queries_fall_back() {
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (_dataset, index, _) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
-            let key = batch["vector"].as_fixed_size_list().value(9);
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            let config = LayeredLazyConfig {
-                enabled: true,
-                ..Default::default()
-            };
-
-            let mut fast = lazy_test_query(key.clone(), 10, 8);
-            fast.approx_mode = ApproxMode::Fast;
-            let stats = assert_lazy_matches_eager(&index, &fast, &filter, config, "fast").await;
-            assert_eq!((stats.ineligible_fast, stats.lazy_queries), (1, 0));
-
-            let base = lazy_test_query(key.clone(), 100, 8);
-            let eager = search_global(&index, &base, filter.clone()).await.unwrap();
-            let mut cascade = with_bounds(&base, &eager).unwrap();
-            cascade.rq_cascade_factor = Some(4);
-            let stats =
-                assert_lazy_matches_eager(&index, &cascade, &filter, config, "cascade").await;
-            assert_eq!((stats.ineligible_cascade, stats.lazy_queries), (1, 0));
-
-            let mut refine = lazy_test_query(key.clone(), 10, 8);
-            refine.refine_factor = Some(2);
-            let stats = assert_lazy_matches_eager(&index, &refine, &filter, config, "refine").await;
-            assert_eq!((stats.ineligible_refine, stats.lazy_queries), (1, 0));
-
-            let mut high = lazy_test_query(key.clone(), 10, 8);
-            high.rq_precision = RQPrecision::High;
-            let stats = assert_lazy_matches_eager(&index, &high, &filter, config, "high").await;
-            assert_eq!((stats.ineligible_precision, stats.lazy_queries), (1, 0));
-
-            // `k == 0` runs the eager scan, which still waits for the
-            // prefilter and so reports its failure.
-            let zero = lazy_test_query(key, 0, 8);
-            let stats = assert_lazy_matches_eager(&index, &zero, &filter, config, "k=0").await;
-            assert_eq!((stats.ineligible_k_zero, stats.lazy_queries), (1, 0));
-            let failing: Arc<dyn PreFilter> = Arc::new(FailingFilter);
-            let ivf = lazy_index(&index);
-            for lazy in [LayeredLazyConfig::default(), config] {
-                ivf.set_layered_lazy_config_for_test(lazy);
-                let error = search_global(&index, &zero, failing.clone())
-                    .await
-                    .unwrap_err();
-                assert!(error.to_string().contains("prefilter failed"), "{error}");
-            }
-            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-        }
-
-        /// A gated backend admits ex planes only behind their resident sign
-        /// plane, so a background promotion would read a whole plane only to
-        /// drop it; sparse gathers never promote there.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_gated_backend_never_promotes() {
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (_dataset, index, _) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::Gated).await;
-            let vectors = batch["vector"].as_fixed_size_list();
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            let config = LayeredLazyConfig {
-                enabled: true,
-                dense: DenseGatherMode::Sparse,
-                promote: LazyPromotion::Background { reads: 1 },
-                ..Default::default()
-            };
-            let mut sparse_planes = 0;
-            for row in 0..4 {
-                let query = lazy_test_query(vectors.value(row * 101), 100, LAZY_PARTITIONS);
-                // Repeat each query so a plane is gathered sparsely more than once.
-                for repeat in 0..2 {
-                    let context = format!("gated row={row} repeat={repeat}");
-                    let stats =
-                        assert_lazy_matches_eager(&index, &query, &filter, config, &context).await;
-                    assert_eq!(stats.lazy_queries, 1, "{context}");
-                    assert_eq!(
-                        (
-                            stats.promotions_issued,
-                            stats.promotions_deduped,
-                            stats.promotions_skipped,
-                            stats.promotion_bytes
-                        ),
-                        (0, 0, 0, 0),
-                        "{context}"
-                    );
-                    sparse_planes += stats
-                        .high_sparse
-                        .iter()
-                        .chain(&stats.low_sparse)
-                        .sum::<u64>();
-                }
-            }
-            assert_eq!(layered_stats::promotions_in_flight(), 0);
-            assert!(sparse_planes > 0, "the gated setup must gather sparsely");
-        }
-
-        /// Empty partitions have no ex rows, so their plane entries, which the
-        /// lazy scan never touches, do not keep a query whose other ex planes
-        /// are all resident off the eager scan.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_empty_partitions_count_as_resident() {
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (_dataset, index, tiered) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::TieredResident).await;
-            let tiered = tiered.unwrap();
-            let ivf = lazy_index(&index);
-            let empty = LAZY_SMALL_PARTITIONS
-                .iter()
-                .find(|(_, rows)| *rows == 0)
-                .map(|(partition, _)| *partition)
-                .unwrap();
-            assert_eq!(ivf.storage.partition_size(empty), 0);
-            let high = ivf.storage.plane_key(empty, 1);
-            assert!(ivf.index_cache.peek_resident_with_key(&high).await);
-            tiered.hide_empty_planes.store(true, Ordering::Relaxed);
-            assert!(!ivf.index_cache.peek_resident_with_key(&high).await);
-
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            let config = LayeredLazyConfig {
-                enabled: true,
-                ..Default::default()
-            };
-            let query = lazy_test_query(
-                batch["vector"].as_fixed_size_list().value(11),
-                100,
-                LAZY_PARTITIONS,
-            );
-            let stats =
-                assert_lazy_matches_eager(&index, &query, &filter, config, "hidden empty planes")
-                    .await;
-            assert_eq!(
-                (stats.lazy_all_resident_skips, stats.lazy_queries),
-                (1, 0),
-                "{stats:?}"
-            );
         }
 
         /// `auto` makes cloud object stores class high and local files and
@@ -10149,7 +9279,7 @@ mod tests {
                 .unwrap();
 
             let setting = origin_latency_setting().unwrap();
-            let lazy_setting = LayeredLazyConfig::from_env().unwrap();
+
             let resident_setting = resident_columns_setting().unwrap();
             let entry_setting = entry_columns_setting().unwrap();
             let vectors = batch["vector"].as_fixed_size_list();
@@ -10158,10 +9288,7 @@ mod tests {
                 lazy_test_query(vectors.value(777), 100, LAZY_PARTITIONS),
             ];
             let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            let lazy = LayeredLazyConfig {
-                enabled: true,
-                ..Default::default()
-            };
+
             let mut first_results = vec![None; queries.len()];
             for hint in [
                 Some(OriginLatencyClass::High),
@@ -10184,7 +9311,7 @@ mod tests {
                 let store_class = OriginLatencyClass::of_store(&dataset.object_store);
                 assert_eq!(store_class, OriginLatencyClass::Low);
                 let expected = setting.or(hint).unwrap_or(store_class);
-                let block_size = dataset.object_store.block_size() as u64;
+
                 let uuid = dataset.load_indices().await.unwrap()[0].uuid;
                 let opened = dataset
                     .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
@@ -10222,19 +9349,10 @@ mod tests {
                         entry_setting.resolve(ivf.resident_columns_enabled()),
                         "{context}"
                     );
-                    assert_eq!(
-                        ivf.lazy_origin_gap_bytes(),
-                        lazy_setting.origin_gap.resolve(expected, block_size),
-                        "{context}"
-                    );
-                    assert_eq!(
-                        ivf.layered_lazy_config().promote,
-                        lazy_setting.promote.resolve(expected),
-                        "{context}"
-                    );
+
                     for (position, query) in queries.iter().enumerate() {
                         let context = format!("{context} query={position}");
-                        assert_lazy_matches_eager(index, query, &filter, lazy, &context).await;
+
                         let eager = search_global(index, query, filter.clone()).await.unwrap();
                         let bits = result_bits(&eager);
                         let first = first_results[position].get_or_insert_with(|| bits.clone());
@@ -10267,7 +9385,6 @@ mod tests {
                     assert_eq!(ivf_pq.entry_columns(), EntryColumns::All);
                 }
             }
-            wait_for_promotions().await;
         }
 
         /// A plane's tier follows where the backend holds it: RAM, then only
@@ -10332,27 +9449,26 @@ mod tests {
 
         /// Every precision in both approximation modes, the cascade, and the
         /// lazy scan over every partition, labelled for assertion messages.
-        fn sign_bounds_test_queries(key: &ArrayRef) -> Vec<(String, Query, LayeredLazyConfig)> {
-            let eager_scan = LayeredLazyConfig::default();
+        fn sign_bounds_test_queries(key: &ArrayRef) -> Vec<(String, Query)> {
             let mut queries = Vec::new();
             for rq_precision in [RQPrecision::Sign, RQPrecision::High, RQPrecision::Full] {
                 for approx_mode in [ApproxMode::Normal, ApproxMode::Accurate] {
                     let mut query = lazy_test_query(key.clone(), 100, 8);
                     query.rq_precision = rq_precision;
                     query.approx_mode = approx_mode;
-                    let label = format!("precision={rq_precision:?} approx={approx_mode:?}");
-                    queries.push((label, query, eager_scan));
+                    queries.push((
+                        format!("precision={rq_precision:?} approx={approx_mode:?}"),
+                        query,
+                    ));
                 }
             }
             let mut cascade = lazy_test_query(key.clone(), 100, 8);
             cascade.rq_cascade_factor = Some(4);
-            queries.push(("cascade".to_string(), cascade, eager_scan));
-            let lazy_scan = LayeredLazyConfig {
-                enabled: true,
-                ..Default::default()
-            };
-            let every_probe = lazy_test_query(key.clone(), 100, LAZY_PARTITIONS);
-            queries.push(("lazy scan".to_string(), every_probe, lazy_scan));
+            queries.push(("cascade".to_string(), cascade));
+            queries.push((
+                "full scan".to_string(),
+                lazy_test_query(key.clone(), 100, LAZY_PARTITIONS),
+            ));
             queries
         }
 
@@ -10405,15 +9521,13 @@ mod tests {
                     assert_sign_planes_coexist(&placements).await;
                 }
                 for key in &keys {
-                    for (label, query, scan) in sign_bounds_test_queries(key) {
+                    for (label, query) in sign_bounds_test_queries(key) {
                         let context =
                             format!("bits={bits} {distance_type:?} cache={cache:?} {label}");
                         let mut results = Vec::new();
                         for index in &placements {
-                            let ivf = lazy_index(index);
-                            ivf.set_layered_lazy_config_for_test(scan);
                             let result = search_global(index, &query, Arc::new(NoFilter)).await;
-                            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+
                             results.push(result_bits(&result.unwrap()));
                         }
                         assert!(!results[0].0.is_empty(), "{context}");
@@ -10498,1021 +9612,6 @@ mod tests {
                 .unwrap();
             assert!(lazy_index(&reopened).is_layered_rq());
             assert_eq!(lazy_index(&reopened).sign_bounds(), expected);
-        }
-
-        /// A row-id remapper can drop physical rows, so offsets are not row
-        /// positions and the lazy scan must not run.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_remapped_index_is_ineligible() {
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (batch, schema) = generate_batch::<Float32Type>(1000, None, 0.0..1.0, false);
-            let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema);
-            let mut dataset = Dataset::write(
-                reader,
-                dir.as_str(),
-                Some(WriteParams {
-                    max_rows_per_file: 200,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-            let params = VectorIndexParams::with_ivf_rq_params(
-                DistanceType::L2,
-                IvfBuildParams::new(4),
-                RQBuildParams::new(7).with_layered(true),
-            );
-            dataset
-                .create_index(&["vector"], IndexType::Vector, None, &params, true)
-                .await
-                .unwrap();
-            dataset.delete("id % 7 = 0").await.unwrap();
-            compact_files(
-                &mut dataset,
-                CompactionOptions {
-                    target_rows_per_fragment: 500,
-                    defer_index_remap: true,
-                    ..Default::default()
-                },
-                None,
-            )
-            .await
-            .unwrap();
-            let uuid = dataset
-                .load_indices()
-                .await
-                .unwrap()
-                .iter()
-                .find(|index| index.name != FRAG_REUSE_INDEX_NAME)
-                .unwrap()
-                .uuid;
-            let index = dataset
-                .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
-                .await
-                .unwrap();
-            assert!(!lazy_index(&index).storage.supports_candidate_reads());
-            let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(1), 20, 4);
-            let stats = assert_lazy_matches_eager(
-                &index,
-                &query,
-                &(Arc::new(NoFilter) as Arc<dyn PreFilter>),
-                LayeredLazyConfig {
-                    enabled: true,
-                    ..Default::default()
-                },
-                "remapper",
-            )
-            .await;
-            assert_eq!((stats.ineligible_remapper, stats.lazy_queries), (1, 0));
-        }
-
-        /// Per-partition, streaming, batch and cascade searches never use the
-        /// lazy scan.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_leaves_other_search_paths_unchanged() {
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (_dataset, index, _) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
-            let ivf = lazy_index(&index);
-            let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(3), 50, 8);
-            let (partitions, dists) = index.find_partitions(&query).unwrap();
-            let partitions = Arc::new(partitions);
-            let dists = Arc::new(dists);
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            let mut cascade = query.clone();
-            cascade.rq_cascade_factor = Some(4);
-
-            let mut outputs = Vec::new();
-            for config in [
-                LayeredLazyConfig::default(),
-                LayeredLazyConfig {
-                    enabled: true,
-                    ..Default::default()
-                },
-            ] {
-                ivf.set_layered_lazy_config_for_test(config);
-                layered_stats::snapshot_and_reset();
-                let in_partition = index
-                    .search_in_partition(
-                        partitions.value(0) as usize,
-                        &query,
-                        filter.clone(),
-                        &NoOpMetricsCollector,
-                    )
-                    .await
-                    .unwrap();
-                let streamed = index
-                    .clone()
-                    .search_partitions(
-                        query.clone(),
-                        partitions.clone(),
-                        dists.clone(),
-                        0,
-                        partitions.len(),
-                        filter.clone(),
-                        Some(Arc::new(NeverStop)),
-                        Arc::new(NoOpMetricsCollector),
-                    )
-                    .await
-                    .unwrap()
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .unwrap();
-                let batched = index
-                    .clone()
-                    .search_partitions_batch(
-                        query.clone(),
-                        vec![partitions.clone()],
-                        vec![dists.clone()],
-                        filter.clone(),
-                        Arc::new(NoOpMetricsCollector),
-                    )
-                    .await
-                    .unwrap();
-                let cascaded = search_global(&index, &cascade, filter.clone())
-                    .await
-                    .unwrap();
-                let stats = layered_stats::snapshot_and_reset();
-                assert_eq!(stats.lazy_queries, 0);
-                assert_eq!(stats.lazy_all_resident_skips, 0);
-                assert_lazy_chain_timing(&stats, "other search paths");
-                let mut output = vec![result_bits(&in_partition), result_bits(&cascaded)];
-                output.extend(streamed.iter().map(result_bits));
-                output.extend(batched.iter().map(result_bits));
-                outputs.push(output);
-            }
-            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-            assert_eq!(outputs[0], outputs[1]);
-        }
-
-        /// Concurrent queries share the promotion tracker, a cleared cache
-        /// and a missing persistent entry fall back to the origin file, and a
-        /// dropped query releases what it holds.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_lifecycle() {
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (dataset, index, tiered) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::Ungated).await;
-            let tiered = tiered.unwrap();
-            let ivf = lazy_index(&index);
-            let vectors = batch["vector"].as_fixed_size_list();
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            let config = LayeredLazyConfig {
-                enabled: true,
-                dense: DenseGatherMode::Sparse,
-                promote: LazyPromotion::Background { reads: 1 },
-                // Gathers the persistent tier cannot serve read origin rows.
-                origin_max_runs: usize::MAX,
-                ..Default::default()
-            };
-            let queries: Vec<Query> = (0..4)
-                .map(|row| lazy_test_query(vectors.value(row * 101), 10, LAZY_PARTITIONS))
-                .collect();
-
-            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-            let mut expected = Vec::new();
-            for query in &queries {
-                expected.push(result_bits(
-                    &search_global(&index, query, filter.clone()).await.unwrap(),
-                ));
-            }
-
-            // Identical queries in parallel promote each plane at most once at a time.
-            ivf.set_layered_lazy_config_for_test(config);
-            layered_stats::snapshot_and_reset();
-            let concurrent = futures::future::try_join_all(
-                queries
-                    .iter()
-                    .chain(queries.iter())
-                    .map(|query| search_global(&index, query, filter.clone())),
-            )
-            .await
-            .unwrap();
-            for (position, result) in concurrent.iter().enumerate() {
-                assert_eq!(result_bits(result), expected[position % queries.len()]);
-            }
-            wait_for_promotions().await;
-            let stats = layered_stats::snapshot_and_reset();
-            assert!(stats.promotions_issued > 0);
-            // A promoted plane the small RAM tier evicted again is not completed.
-            assert!(stats.promotions_completed > 0, "{stats:?}");
-            assert!(
-                stats.promotions_completed <= stats.promotions_issued,
-                "{stats:?}"
-            );
-
-            // Without persistent rows the gathers read the origin file. The
-            // promotions above may have left every plane these queries need
-            // resident, which would skip the gathers, so empty the RAM tier.
-            tiered.ram.clear().await;
-            tiered.serve_rows.store(false, Ordering::Relaxed);
-            for (query, expected) in queries.iter().zip(&expected) {
-                let result = search_global(&index, query, filter.clone()).await.unwrap();
-                assert_eq!(&result_bits(&result), expected);
-            }
-            wait_for_promotions().await;
-            let stats = layered_stats::snapshot_and_reset();
-            assert!(stats.origin_row_reads > 0, "{stats:?}");
-            tiered.serve_rows.store(true, Ordering::Relaxed);
-
-            // Clearing the cache between queries loses every plane entry.
-            tiered.clear().await;
-            for (query, expected) in queries.iter().zip(&expected) {
-                let result = search_global(&index, query, filter.clone()).await.unwrap();
-                assert_eq!(&result_bits(&result), expected);
-            }
-            wait_for_promotions().await;
-            let stats = layered_stats::snapshot_and_reset();
-            assert!(stats.origin_row_reads > 0, "{stats:?}");
-
-            // A dropped query stops its producer and releases its partitions.
-            for timeout in [1, 5, 50] {
-                let _ = tokio::time::timeout(
-                    Duration::from_micros(timeout),
-                    search_global(&index, &queries[0], filter.clone()),
-                )
-                .await;
-            }
-            wait_for_promotions().await;
-            for _ in 0..500 {
-                if ivf.prepared_partitions().in_flight() == 0 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert_eq!(ivf.prepared_partitions().in_flight(), 0);
-            let result = search_global(&index, &queries[0], filter.clone())
-                .await
-                .unwrap();
-            assert_eq!(result_bits(&result), expected[0]);
-            wait_for_promotions().await;
-            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-            drop(dataset);
-        }
-
-        /// A staged probe the producer is not polling must not hold a slot of
-        /// a fair cache resource that the head gather waits for.
-        ///
-        /// Every RAM admission of the backend waits for a slot in a bounded
-        /// spill channel drained slowly, like a tiered cache whose admissions
-        /// queue their evictions for the disk. Staging steps queue there for
-        /// sign planes ahead of the gathers' whole ex planes. With one step
-        /// window the gather buffer holds three probes, and while its head is
-        /// pending the producer stops polling the staging buffer. When the
-        /// steps were plain futures in those buffers, the channel handed the
-        /// next freed slot to its oldest waiter, a staging step nobody polled,
-        /// which never used it: the head gather and every later admission then
-        /// waited forever. Steps now run as tasks and complete on their own,
-        /// whether gathers before the heap fills are deferred or issued at
-        /// once, and when staging loads predicted-dense probes for the eager
-        /// scan instead (every probe here, as whole gathers predict them dense).
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_unpolled_staging_cannot_hold_spill_slot() {
-            const PROBES: usize = 32;
-            const QUERIES: usize = 16;
-            // Staged probes in flight; the deadlock needs staging steps
-            // queued on the spill channel behind the ones that fill the
-            // gather buffer, whatever the host's core count.
-            const STAGING_STEPS: usize = 8;
-            const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (_dataset, index, tiered) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::Tiny).await;
-            let tiered = tiered.unwrap();
-            let ivf = lazy_index(&index);
-            let vectors = batch["vector"].as_fixed_size_list();
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            // A quarter of the probed rows: the first probes are gathered
-            // before the heap fills, the later ones gate on its threshold.
-            let k = LAZY_ROWS * PROBES / LAZY_PARTITIONS / 4;
-            let queries: Vec<Query> = (0..QUERIES)
-                .map(|row| lazy_test_query(vectors.value(row * 211), k, PROBES))
-                .collect();
-
-            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-            let mut expected = Vec::with_capacity(QUERIES);
-            for query in &queries {
-                expected.push(result_bits(
-                    &search_global(&index, query, filter.clone()).await.unwrap(),
-                ));
-            }
-
-            let (spill_tx, mut spill_rx) = tokio::sync::mpsc::channel::<()>(1);
-            let drainer = tokio::spawn(async move {
-                while spill_rx.recv().await.is_some() {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            });
-            tiered.set_spill(Some(spill_tx));
-            ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
-            for (eager_before_full, dense_to_eager) in [
-                (false, DenseToEager::Off),
-                (true, DenseToEager::Off),
-                (true, DenseToEager::All),
-            ] {
-                ivf.set_layered_lazy_config_for_test(LayeredLazyConfig {
-                    enabled: true,
-                    window: 1,
-                    dense: DenseGatherMode::Whole,
-                    promote: LazyPromotion::Off,
-                    eager_before_full,
-                    dense_to_eager,
-                    ..Default::default()
-                });
-                let setting = format!(
-                    "eager_before_full={eager_before_full} dense_to_eager={dense_to_eager}"
-                );
-                layered_stats::snapshot_and_reset();
-                for (position, (query, expected)) in queries.iter().zip(&expected).enumerate() {
-                    let result = tokio::time::timeout(
-                        QUERY_TIMEOUT,
-                        search_global(&index, query, filter.clone()),
-                    )
-                    .await
-                    .unwrap_or_else(|_| {
-                        panic!(
-                            "lazy query {position} ({setting}) did not finish within {QUERY_TIMEOUT:?}"
-                        )
-                    })
-                    .unwrap();
-                    assert_eq!(
-                        &result_bits(&result),
-                        expected,
-                        "query {position} {setting}"
-                    );
-                }
-                let stats = layered_stats::snapshot_and_reset();
-                assert_eq!(stats.lazy_queries, QUERIES as u64, "{setting} {stats:?}");
-                assert_eq!(stats.needed_not_fetched, 0, "{setting} {stats:?}");
-                let whole_planes: u64 = stats.high_whole.iter().chain(&stats.low_whole).sum();
-                let eager_loads: u64 = stats.dense_to_eager.iter().sum();
-                if dense_to_eager == DenseToEager::All {
-                    assert!(
-                        eager_loads > 0 && whole_planes == 0,
-                        "staging must load every probe eagerly: {setting} {stats:?}"
-                    );
-                } else {
-                    assert!(
-                        eager_loads == 0 && whole_planes > 0,
-                        "gathers must admit whole ex planes: {setting} {stats:?}"
-                    );
-                }
-            }
-            tiered.set_spill(None);
-            drainer.abort();
-            ivf.set_lazy_prepare_parallelism_for_test(0);
-            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-        }
-
-        /// Sums of the lazy counters that tell routing, issue and origin
-        /// policies apart.
-        #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-        struct IssueTotals {
-            dense_to_eager: [u64; RANK_BUCKETS],
-            certain_dense: [u64; RANK_BUCKETS],
-            lazy_probes: u64,
-            empty: u64,
-            eager_before_full: u64,
-            deferred_issues: u64,
-            serial_waits: u64,
-            origin_whole_fallbacks: u64,
-            origin_row_reads: u64,
-            sparse_planes: u64,
-            whole_planes: u64,
-            rank0_scored_queries: u64,
-            first_gather_issue_queries: u64,
-            release_wait_ns: u64,
-        }
-
-        impl IssueTotals {
-            fn add(&mut self, stats: &LayeredLazyStats) {
-                for (totals, counts) in [
-                    (&mut self.dense_to_eager, stats.dense_to_eager),
-                    (&mut self.certain_dense, stats.certain_dense),
-                ] {
-                    for (total, count) in totals.iter_mut().zip(counts) {
-                        *total += count;
-                    }
-                }
-                self.lazy_probes += stats.lazy_probes.iter().sum::<u64>();
-                self.empty += stats.empty.iter().sum::<u64>();
-                self.eager_before_full += stats.eager_before_full;
-                self.deferred_issues += stats.deferred_issues;
-                self.serial_waits += stats.serial_waits;
-                self.origin_whole_fallbacks += stats.origin_whole_fallbacks;
-                self.origin_row_reads += stats.origin_row_reads;
-                self.sparse_planes += stats
-                    .high_sparse
-                    .iter()
-                    .chain(&stats.low_sparse)
-                    .sum::<u64>();
-                self.whole_planes += stats.high_whole.iter().chain(&stats.low_whole).sum::<u64>();
-                self.rank0_scored_queries += stats.lazy_rank0_scored_queries;
-                self.first_gather_issue_queries += stats.lazy_first_gather_issue_queries;
-                self.release_wait_ns += stats.lazy_release_wait_ns;
-            }
-        }
-
-        /// Issuing gathers before the heap fills, and loading whole planes
-        /// instead of many origin row runs, change only what is read: results
-        /// match the eager scan with either switched on or off, including `k`
-        /// beyond the rows of the first probes and backends that serve no
-        /// persistent rows. Backends that gate plane admission (Lance's
-        /// default cache included) never fall back to whole planes. Dense
-        /// probes stay in the lazy pipeline here, so every probe is gathered.
-        #[rstest]
-        #[case::origin(LazyTestCache::Origin, true)]
-        #[case::small(LazyTestCache::Small, true)]
-        #[case::gated(LazyTestCache::Gated, true)]
-        #[case::tiny_without_rows(LazyTestCache::Tiny, false)]
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_eager_before_full_matches_eager(
-            #[case] cache: LazyTestCache,
-            #[case] serve_rows: bool,
-        ) {
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (_dataset, index, tiered) = open_lazy_test_index(dir.as_str(), cache).await;
-            if let Some(tiered) = &tiered {
-                tiered.serve_rows.store(serve_rows, Ordering::Relaxed);
-            }
-            let origin_only = tiered.is_none() || !serve_rows;
-            let gated = lazy_index(&index).index_cache.plane_admission_gated();
-            let vectors = batch["vector"].as_fixed_size_list();
-            let filters = lazy_test_filters();
-            let mut totals: HashMap<(bool, usize), IssueTotals> = HashMap::new();
-            let mut case = 0usize;
-            for row in [0, 777] {
-                for nprobes in [8, LAZY_PARTITIONS] {
-                    for k in [10, 1000, 5000, LAZY_ROWS + 1] {
-                        for eager_before_full in [true, false] {
-                            for origin_max_runs in [0, 2, usize::MAX] {
-                                for dense in [DenseGatherMode::Cost, DenseGatherMode::Sparse] {
-                                    case += 1;
-                                    let (filter_name, filter) = &filters[case % filters.len()];
-                                    let config = LayeredLazyConfig {
-                                        enabled: true,
-                                        dense,
-                                        eager_before_full,
-                                        origin_max_runs,
-                                        dense_to_eager: DenseToEager::Off,
-                                        ..Default::default()
-                                    };
-                                    let query = lazy_test_query(vectors.value(row), k, nprobes);
-                                    let context = format!(
-                                        "cache={cache:?} serve_rows={serve_rows} row={row} nprobes={nprobes} k={k} filter={filter_name} config={config:?}"
-                                    );
-                                    let stats = assert_lazy_matches_eager(
-                                        &index, &query, filter, config, &context,
-                                    )
-                                    .await;
-                                    if !eager_before_full {
-                                        assert_eq!(stats.eager_before_full, 0, "{context}");
-                                    }
-                                    if origin_max_runs == usize::MAX || gated {
-                                        assert_eq!(stats.origin_whole_fallbacks, 0, "{context}");
-                                    }
-                                    totals
-                                        .entry((eager_before_full, origin_max_runs))
-                                        .or_default()
-                                        .add(&stats);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            wait_for_promotions().await;
-            let on_uncapped = totals[&(true, usize::MAX)];
-            assert!(on_uncapped.eager_before_full > 0, "{totals:?}");
-            if origin_only && !gated {
-                // The origin run cap applies with either issue policy.
-                for eager_before_full in [true, false] {
-                    let capped = totals[&(eager_before_full, 0)];
-                    assert!(capped.origin_whole_fallbacks > 0, "{totals:?}");
-                    assert_eq!(capped.origin_row_reads, 0, "{totals:?}");
-                    assert!(
-                        totals[&(eager_before_full, usize::MAX)].origin_row_reads > 0,
-                        "{totals:?}"
-                    );
-                }
-            }
-        }
-
-        /// Loading and scoring predicted-dense probes with the eager scan
-        /// changes only how they are read: results match the eager scan with
-        /// the routing off, on for every such probe (`all`) or on for those
-        /// that read a plane from a high-latency origin (`origin`) of either
-        /// class, for `k` within the first probe and beyond the rows of the
-        /// first probes, with prefilters that keep most or few rows and with
-        /// distance bounds, whether the planes come from the origin, an
-        /// ungated persistent tier or a tier that gates admission. Only
-        /// queries without a prefilter or upper bound are routed: those drop
-        /// rows of every probe before its gather, even at `k` beyond every
-        /// probed row, so their probes stay in the lazy pipeline. `origin`
-        /// routes no probe on a low-latency origin, and on a high-latency one
-        /// only probes with a plane on no cache tier: every probe `all`
-        /// routes when nothing is cached, none once the persistent tier holds
-        /// every plane.
-        #[rstest]
-        #[case::origin(LazyTestCache::Origin)]
-        #[case::ungated(LazyTestCache::Ungated)]
-        #[case::gated(LazyTestCache::Gated)]
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_dense_to_eager_matches_eager(#[case] cache: LazyTestCache) {
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (dataset, index, _) = open_lazy_test_index(dir.as_str(), cache).await;
-            let vectors = batch["vector"].as_fixed_size_list();
-            let filters: Vec<_> = lazy_test_filters()
-                .into_iter()
-                .filter(|(name, _)| matches!(*name, "none" | "sparse" | "dense"))
-                .collect();
-            let mut cases = Vec::new();
-            for row in [0, 777] {
-                for nprobes in [1, 8, LAZY_PARTITIONS] {
-                    for k in [10, 1000, LAZY_ROWS + 1] {
-                        for (filter_name, filter) in &filters {
-                            let query = lazy_test_query(vectors.value(row), k, nprobes);
-                            let eager =
-                                search_global(&index, &query, filter.clone()).await.unwrap();
-                            let bounded = with_bounds(&query, &eager);
-                            for query in std::iter::once(query).chain(bounded) {
-                                let label = format!(
-                                    "cache={cache:?} row={row} nprobes={nprobes} k={k} filter={filter_name} bounds={}",
-                                    query.upper_bound.is_some()
-                                );
-                                cases.push((label, *filter_name == "none", query, filter.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-
-            let (store, index_dir) = index_files(&dataset).await;
-            let (low, high) = (OriginLatencyClass::Low, OriginLatencyClass::High);
-            let low_index =
-                open_with_origin_latency(&dataset, store.clone(), index_dir.clone(), low).await;
-            let high_index = open_with_origin_latency(&dataset, store, index_dir, high).await;
-            // `off` and `all` do not depend on the class.
-            let settings = [
-                (DenseToEager::Off, low),
-                (DenseToEager::All, low),
-                (DenseToEager::Origin, low),
-                (DenseToEager::Origin, high),
-            ];
-            let mut routed = [0u64; 4];
-            for (label, unfiltered, query, filter) in &cases {
-                let mut routed_by_all = None;
-                for (position, &(mode, class)) in settings.iter().enumerate() {
-                    let index = match class {
-                        OriginLatencyClass::Low => &low_index,
-                        OriginLatencyClass::High => &high_index,
-                    };
-                    let config = LayeredLazyConfig {
-                        enabled: true,
-                        dense_to_eager: mode,
-                        ..Default::default()
-                    };
-                    let context = format!("{label} dense_to_eager={mode} class={class}");
-                    let stats =
-                        assert_lazy_matches_eager(index, query, filter, config, &context).await;
-                    let context = format!("{context} {stats:?}");
-                    let probes_routed: u64 = stats.dense_to_eager.iter().sum();
-                    let slow_probes: u64 = stats.s3_bound_probes.iter().sum();
-                    if !unfiltered || query.upper_bound.is_some() {
-                        assert_eq!(probes_routed, 0, "{context}");
-                    }
-                    if class == low {
-                        assert_eq!(slow_probes, 0, "{context}");
-                    }
-                    // Every probe `origin` routes reads a plane from the origin.
-                    if mode == DenseToEager::Origin {
-                        let mut buckets = stats.dense_to_eager.iter().zip(&stats.s3_bound_probes);
-                        assert!(buckets.all(|(routed, slow)| routed <= slow), "{context}");
-                    }
-                    if mode == DenseToEager::All {
-                        routed_by_all = Some(stats.dense_to_eager);
-                    } else if class == high && stats.lazy_queries == 1 {
-                        match cache {
-                            // Nothing is cached: every staged probe reads the origin.
-                            LazyTestCache::Origin => {
-                                let empty_probes: u64 = stats.empty.iter().sum();
-                                assert_eq!(
-                                    slow_probes + empty_probes,
-                                    query.minimum_nprobes as u64,
-                                    "{context}"
-                                );
-                                assert_eq!(Some(stats.dense_to_eager), routed_by_all, "{context}");
-                            }
-                            // Prewarm persisted every plane.
-                            LazyTestCache::Ungated => {
-                                assert_eq!((probes_routed, slow_probes), (0, 0), "{context}");
-                            }
-                            _ => {}
-                        }
-                    }
-                    routed[position] += probes_routed;
-                }
-            }
-            wait_for_promotions().await;
-            let [off, all, origin_low, origin_high] = routed;
-            assert_eq!(off, 0, "switched off, no probe is routed");
-            assert!(all > 0, "{routed:?}");
-            assert_eq!(origin_low, 0, "a low-latency origin routes no probe");
-            match cache {
-                LazyTestCache::Origin => assert_eq!(origin_high, all, "{routed:?}"),
-                LazyTestCache::Ungated => assert_eq!(origin_high, 0, "{routed:?}"),
-                _ => {}
-            }
-        }
-
-        /// `count` queries for `k` rows over `nprobes` probes, keyed by rows
-        /// of `vectors`, whose first probe alone holds more than `2 * k` rows:
-        /// it fills the heap, and the threshold then keeps under half of the
-        /// rows scored, so later gathers are not expected to be dense.
-        fn queries_filled_by_first_probe(
-            index: &Arc<dyn VectorIndex>,
-            vectors: &FixedSizeListArray,
-            k: usize,
-            nprobes: usize,
-            count: usize,
-        ) -> Vec<Query> {
-            let queries: Vec<Query> = (0..vectors.len())
-                .step_by(211)
-                .map(|row| lazy_test_query(vectors.value(row), k, nprobes))
-                .filter(|query| {
-                    let (partitions, _) = index.find_partitions(query).unwrap();
-                    lazy_index(index)
-                        .storage
-                        .partition_size(partitions.value(0) as usize)
-                        > 2 * k
-                })
-                .take(count)
-                .collect();
-            assert_eq!(queries.len(), count);
-            queries
-        }
-
-        /// Lazy settings without promotions, with the given issue and routing
-        /// policies.
-        fn issue_policy(
-            eager_before_full: bool,
-            dense_to_eager: DenseToEager,
-        ) -> LayeredLazyConfig {
-            LayeredLazyConfig {
-                enabled: true,
-                promote: LazyPromotion::Off,
-                eager_before_full,
-                dense_to_eager,
-                ..Default::default()
-            }
-        }
-
-        /// Issue counters of the lazy scan under each of `configs`, summed
-        /// over `queries`.
-        async fn lazy_issue_totals<const N: usize>(
-            index: &Arc<dyn VectorIndex>,
-            queries: &[Query],
-            filter: &Arc<dyn PreFilter>,
-            configs: [LayeredLazyConfig; N],
-        ) -> [IssueTotals; N] {
-            let mut totals = [IssueTotals::default(); N];
-            for (config, totals) in configs.into_iter().zip(&mut totals) {
-                for (position, query) in queries.iter().enumerate() {
-                    let context = format!(
-                        "eager_before_full={} dense_to_eager={} query={position} k={}",
-                        config.eager_before_full, config.dense_to_eager, query.k
-                    );
-                    let stats =
-                        assert_lazy_matches_eager(index, query, filter, config, &context).await;
-                    assert_eq!(stats.lazy_queries, 1, "{context}");
-                    totals.add(&stats);
-                }
-            }
-            totals
-        }
-
-        /// Which probes the eager scan loads, and whether lazy gathers may be
-        /// issued before the heap fills, depend on `k`, not on how staging
-        /// races the first probes.
-        ///
-        /// When `k` spans several probes, the gathers issued once the heap
-        /// fills would read whole planes anyway, so with every predicted-dense
-        /// probe routed (`all`) every probe is loaded and scored by the eager
-        /// scan and no ex plane is gathered whole. With the routing off, the
-        /// gathers read the planes whole and are issued at once, and none
-        /// waits for the heap or its turn.
-        ///
-        /// When the first probe alone fills the heap (small `k`), only that
-        /// probe, scored with an infinite threshold, goes to the eager scan,
-        /// exactly the probe the lazy pipeline otherwise gathers as certain
-        /// dense; later gathers wait for its finite threshold, as the
-        /// eager-before-full ablation always does.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_issue_policy_depends_on_k() {
-            const PROBES: usize = 32;
-            const QUERIES: usize = 8;
-            const STAGING_STEPS: usize = 8;
-            const SMALL_K: usize = 10;
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (_dataset, index, _) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
-            let ivf = lazy_index(&index);
-            let vectors = batch["vector"].as_fixed_size_list();
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            // A quarter of the probed rows, several probes' worth.
-            let large_k = LAZY_ROWS * PROBES / LAZY_PARTITIONS / 4;
-            let queries = |k: usize| -> Vec<Query> {
-                (0..QUERIES)
-                    .map(|row| lazy_test_query(vectors.value(row * 211), k, PROBES))
-                    .collect()
-            };
-            let small = queries_filled_by_first_probe(&index, vectors, SMALL_K, PROBES, QUERIES);
-            let configs = [
-                issue_policy(true, DenseToEager::All),
-                issue_policy(true, DenseToEager::Off),
-                issue_policy(false, DenseToEager::Off),
-            ];
-            ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
-            let [large_routed, large_on, large_off] =
-                lazy_issue_totals(&index, &queries(large_k), &filter, configs).await;
-            let [small_routed, small_on, small_off] =
-                lazy_issue_totals(&index, &small, &filter, configs).await;
-            ivf.set_lazy_prepare_parallelism_for_test(0);
-
-            // Nothing is resident, so every probe of a non-empty partition
-            // goes to the eager scan, in every rank bucket the probes reach.
-            let probes = (QUERIES * PROBES) as u64;
-            let routed: u64 = large_routed.dense_to_eager.iter().sum();
-            assert_eq!(routed + large_routed.empty, probes, "{large_routed:?}");
-            assert!(
-                large_routed.dense_to_eager[..4]
-                    .iter()
-                    .all(|&count| count > 0),
-                "{large_routed:?}"
-            );
-            assert_eq!(large_routed.dense_to_eager[4], 0, "{large_routed:?}");
-            assert_eq!(
-                (
-                    large_routed.lazy_probes,
-                    large_routed.whole_planes,
-                    large_routed.eager_before_full,
-                    large_routed.deferred_issues,
-                ),
-                (0, 0, 0, 0),
-                "{large_routed:?}"
-            );
-            assert_eq!(large_routed.certain_dense, [0; RANK_BUCKETS]);
-            for large in [large_on, large_off] {
-                assert_eq!(large.dense_to_eager, [0; RANK_BUCKETS], "{large:?}");
-                assert_eq!(large.lazy_probes + large.empty, probes, "{large:?}");
-                assert!(large.whole_planes > 0, "{large:?}");
-                assert!(large.certain_dense[0] > 0, "{large:?}");
-            }
-            assert_eq!(
-                (large_on.deferred_issues, large_on.serial_waits),
-                (0, 0),
-                "{large_on:?}"
-            );
-            assert!(large_on.eager_before_full > 0, "{large_on:?}");
-            assert_eq!(large_off.eager_before_full, 0, "{large_off:?}");
-            assert!(large_off.deferred_issues > 0, "{large_off:?}");
-
-            let mut first_probe = [0; RANK_BUCKETS];
-            first_probe[0] = QUERIES as u64;
-            assert_eq!(small_routed.dense_to_eager, first_probe, "{small_routed:?}");
-            assert_eq!(small_routed.certain_dense, [0; RANK_BUCKETS]);
-            assert!(small_routed.lazy_probes > 0, "{small_routed:?}");
-            for small in [small_on, small_off] {
-                assert_eq!(small.dense_to_eager, [0; RANK_BUCKETS], "{small:?}");
-                assert_eq!(small.certain_dense, first_probe, "{small:?}");
-                assert!(small.deferred_issues > 0, "{small:?}");
-            }
-            for small in [small_routed, small_on, small_off] {
-                assert_eq!(
-                    (small.eager_before_full, small.serial_waits),
-                    (0, 0),
-                    "{small:?}"
-                );
-            }
-
-            // Every scan times its first probe's scoring, and a wait for the
-            // threshold or a turn is timed exactly when one happens. Each
-            // small-`k` query gathers later probes, whose issue waits on the
-            // first probe's threshold (see `assert_lazy_chain_timing`),
-            // whether that probe is routed or gathered as certain dense; the
-            // routed large-`k` queries gather nothing.
-            let queries = QUERIES as u64;
-            for totals in [
-                large_routed,
-                large_on,
-                large_off,
-                small_routed,
-                small_on,
-                small_off,
-            ] {
-                assert_eq!(totals.rank0_scored_queries, queries, "{totals:?}");
-                assert_eq!(
-                    totals.release_wait_ns > 0,
-                    totals.deferred_issues > 0,
-                    "{totals:?}"
-                );
-            }
-            assert_eq!(
-                large_routed.first_gather_issue_queries, 0,
-                "{large_routed:?}"
-            );
-            for small in [small_routed, small_on, small_off] {
-                assert_eq!(small.first_gather_issue_queries, queries, "{small:?}");
-            }
-        }
-
-        /// A selective prefilter keeps the heap from filling after the probes
-        /// that hold `k` rows. Deferred gathers are then issued at once
-        /// instead of one probe at a time, with identical results; the
-        /// ablation waits for each probe's turn.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_eager_before_full_when_filters_delay_the_heap() {
-            const PROBES: usize = 16;
-            const QUERIES: usize = 8;
-            const STAGING_STEPS: usize = 8;
-            const K: usize = 100;
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (_dataset, index, _) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
-            let ivf = lazy_index(&index);
-            let vectors = batch["vector"].as_fixed_size_list();
-            let (_, filter) = lazy_test_filters()
-                .into_iter()
-                .find(|(name, _)| *name == "sparse")
-                .unwrap();
-            // The first probe alone holds `k` rows, too few of which the
-            // filter accepts.
-            let queries = queries_filled_by_first_probe(&index, vectors, K, PROBES, QUERIES);
-            ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
-            let configs = [
-                issue_policy(true, DenseToEager::Off),
-                issue_policy(false, DenseToEager::Off),
-            ];
-            let [on, off] = lazy_issue_totals(&index, &queries, &filter, configs).await;
-            ivf.set_lazy_prepare_parallelism_for_test(0);
-            assert!(on.eager_before_full > 0, "{on:?}");
-            assert!(on.serial_waits < off.serial_waits, "{on:?} {off:?}");
-            assert_eq!(off.eager_before_full, 0, "{off:?}");
-        }
-
-        /// A lazy first probe whose survivors fill the heap publishes the
-        /// heap's top partway through its scoring, once per query at rank 0,
-        /// only with partial publishes on; the probe stays certain dense
-        /// either way. Routed to the eager scan, which publishes only once a
-        /// probe is scored whole, it publishes no mid-probe threshold. Every
-        /// setting matches the eager scan, and the gathers that took a
-        /// mid-probe threshold are counted within the lazy gathers (see
-        /// `assert_partial_publish_counts`).
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_partial_publish_counts_mid_probe_thresholds() {
-            const PROBES: usize = 32;
-            const QUERIES: usize = 8;
-            const STAGING_STEPS: usize = 8;
-            const K: usize = 10;
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (_dataset, index, _) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
-            let ivf = lazy_index(&index);
-            let vectors = batch["vector"].as_fixed_size_list();
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            let queries = queries_filled_by_first_probe(&index, vectors, K, PROBES, QUERIES);
-            let mut first_probe = [0; RANK_BUCKETS];
-            first_probe[0] = QUERIES as u64;
-            ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
-            for (dense_to_eager, partial_publish) in [
-                (DenseToEager::Off, true),
-                (DenseToEager::Off, false),
-                (DenseToEager::All, true),
-            ] {
-                let config = LayeredLazyConfig {
-                    partial_publish,
-                    ..issue_policy(true, dense_to_eager)
-                };
-                let mut publishes = [0; RANK_BUCKETS];
-                let mut certain_dense = [0; RANK_BUCKETS];
-                let mut routed = [0; RANK_BUCKETS];
-                for (position, query) in queries.iter().enumerate() {
-                    let context = format!(
-                        "dense_to_eager={dense_to_eager} partial_publish={partial_publish} query={position}"
-                    );
-                    let stats =
-                        assert_lazy_matches_eager(&index, query, &filter, config, &context).await;
-                    assert_eq!(stats.lazy_queries, 1, "{context}");
-                    for (totals, counts) in [
-                        (&mut publishes, stats.mid_probe_full_publishes),
-                        (&mut certain_dense, stats.certain_dense),
-                        (&mut routed, stats.dense_to_eager),
-                    ] {
-                        for (total, count) in totals.iter_mut().zip(counts) {
-                            *total += count;
-                        }
-                    }
-                }
-                let context =
-                    format!("dense_to_eager={dense_to_eager} partial_publish={partial_publish}");
-                let lazy_first_probe = dense_to_eager == DenseToEager::Off;
-                let expected_publishes = if lazy_first_probe && partial_publish {
-                    first_probe
-                } else {
-                    [0; RANK_BUCKETS]
-                };
-                assert_eq!(publishes, expected_publishes, "{context}");
-                let (expected_dense, expected_routed) = if lazy_first_probe {
-                    (first_probe, [0; RANK_BUCKETS])
-                } else {
-                    ([0; RANK_BUCKETS], first_probe)
-                };
-                assert_eq!(certain_dense, expected_dense, "{context}");
-                assert_eq!(routed, expected_routed, "{context}");
-            }
-            ivf.set_lazy_prepare_parallelism_for_test(0);
-        }
-
-        /// A sparse gather the persistent tier cannot serve loads the whole
-        /// plane once its origin row runs exceed the cap, whether gathers
-        /// before the heap fills are deferred or not, with identical results.
-        /// Without a cap, or on a backend that gates plane admission (which
-        /// may not admit the plane; Lance's default cache is one), it reads
-        /// the rows.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_origin_runs_fall_back_to_whole_plane() {
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let vectors = batch["vector"].as_fixed_size_list();
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            for cache in [
-                LazyTestCache::Origin,
-                LazyTestCache::Ungated,
-                LazyTestCache::Gated,
-            ] {
-                let (_dataset, index, tiered) = open_lazy_test_index(dir.as_str(), cache).await;
-                if let Some(tiered) = &tiered {
-                    // Every sparse gather that misses RAM goes to the origin.
-                    tiered.serve_rows.store(false, Ordering::Relaxed);
-                }
-                let gated = lazy_index(&index).index_cache.plane_admission_gated();
-                assert_eq!(gated, cache != LazyTestCache::Ungated, "{cache:?}");
-                for eager_before_full in [true, false] {
-                    for origin_max_runs in [0, usize::MAX] {
-                        let config = LayeredLazyConfig {
-                            enabled: true,
-                            dense: DenseGatherMode::Sparse,
-                            promote: LazyPromotion::Off,
-                            eager_before_full,
-                            origin_max_runs,
-                            ..Default::default()
-                        };
-                        let mut totals = IssueTotals::default();
-                        for row in 0..4 {
-                            let query =
-                                lazy_test_query(vectors.value(row * 101), 100, LAZY_PARTITIONS);
-                            let context = format!("{cache:?} {config:?} row={row}");
-                            totals.add(
-                                &assert_lazy_matches_eager(
-                                    &index, &query, &filter, config, &context,
-                                )
-                                .await,
-                            );
-                        }
-                        let context = format!("{cache:?} {config:?} {totals:?}");
-                        if origin_max_runs == 0 && !gated {
-                            // Every origin gather takes at least one run.
-                            assert!(totals.origin_whole_fallbacks > 0, "{context}");
-                            assert_eq!(
-                                (totals.origin_row_reads, totals.sparse_planes),
-                                (0, 0),
-                                "{context}"
-                            );
-                        } else {
-                            assert_eq!(totals.origin_whole_fallbacks, 0, "{context}");
-                            assert!(totals.origin_row_reads > 0, "{context}");
-                        }
-                    }
-                }
-            }
         }
 
         /// A backend that admits planes like any entry loads a missed
@@ -11999,17 +10098,15 @@ mod tests {
                             let mut query = lazy_test_query(key.clone(), 100, 8);
                             query.approx_mode = approx_mode;
                             let label = format!("approx={approx_mode:?}");
-                            (label, query, LayeredLazyConfig::default())
+                            (label, query)
                         })
                         .collect()
                 };
-                for (label, query, scan) in queries {
+                for (label, query) in queries {
                     let mut results = Vec::new();
                     for index in [&file, &shared, &copied] {
-                        let ivf = lazy_index(index);
-                        ivf.set_layered_lazy_config_for_test(scan);
                         let result = search_global(index, &query, Arc::new(NoFilter)).await;
-                        ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+
                         results.push(result_bits(&result.unwrap()));
                     }
                     let context = format!("layered={layered} {label}");
@@ -12169,12 +10266,11 @@ mod tests {
             dataset: &Dataset,
             uuid: &Uuid,
             query: &Query,
-            config: LayeredLazyConfig,
         ) -> Result<Arc<dyn VectorIndex>> {
             let index = dataset
                 .open_vector_index("vector", uuid, &NoOpMetricsCollector)
                 .await?;
-            lazy_index(&index).set_layered_lazy_config_for_test(config);
+
             search_global(&index, query, Arc::new(NoFilter)).await?;
             Ok(index)
         }
@@ -12195,7 +10291,6 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn test_concurrent_cold_opens_load_once(#[case] cache_bytes: usize) {
             const OPENS: usize = 8;
-            const FAR_INFLIGHT: usize = 2;
             let _serial = LAZY_TEST_LOCK.lock().await;
             let registry = cloud_test_registry();
             let (uri, batch) = write_cloud_lazy_test_dataset(registry.clone()).await;
@@ -12206,11 +10301,6 @@ mod tests {
             let file = index_file_key(&dataset, &index_meta);
             let key = batch["vector"].as_fixed_size_list().value(0);
             let query = lazy_test_query(key, 10, 8);
-            let config = LayeredLazyConfig {
-                enabled: true,
-                far_inflight: FAR_INFLIGHT,
-                ..Default::default()
-            };
 
             assert!(!resident_store_is_live(&file));
             layered_stats::snapshot_and_reset();
@@ -12261,26 +10351,15 @@ mod tests {
                 assert_eq!(store.loaded_bytes(), loaded);
             }
             // The searches read through the loaded store, and load nothing.
-            futures::future::try_join_all(indexes.iter().map(|index| {
-                lazy_index(index).set_layered_lazy_config_for_test(config);
-                search_global(index, &query, Arc::new(NoFilter))
-            }))
+            futures::future::try_join_all(
+                indexes
+                    .iter()
+                    .map(|index| search_global(index, &query, Arc::new(NoFilter))),
+            )
             .await
             .unwrap();
             let stats = layered_stats::snapshot_and_reset();
-            assert_eq!(stats.lazy_queries, OPENS as u64, "{stats:?}");
             assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
-
-            let pools: Vec<_> = indexes
-                .iter()
-                .map(|index| lazy_index(index).storage.lazy_far_permits(&config).unwrap())
-                .collect();
-            let held = pools[0].try_acquire().unwrap();
-            for pool in &pools {
-                assert_eq!((pool.size(), pool.in_flight()), (FAR_INFLIGHT, 1));
-            }
-            drop(held);
-            assert!(pools.iter().all(|pool| pool.in_flight() == 0));
         }
 
         /// A cached state lost while an older index of its file still runs
@@ -12312,17 +10391,10 @@ mod tests {
                 crate::index::IvfIndexStateCacheKey::new(&uuid, frag_reuse_uuid.as_ref());
             let key = batch["vector"].as_fixed_size_list().value(0);
             let query = lazy_test_query(key, 10, 8);
-            let config = LayeredLazyConfig::default();
-            let far = LayeredLazyConfig {
-                far_inflight: 2,
-                ..config
-            };
 
             assert!(!resident_store_is_live(&file));
             layered_stats::snapshot_and_reset();
-            let old = open_and_search(&dataset, &uuid, &query, config)
-                .await
-                .unwrap();
+            let old = open_and_search(&dataset, &uuid, &query).await.unwrap();
             let ivf = lazy_index(&old);
             let loaded = ivf
                 .resident_columns_enabled()
@@ -12334,15 +10406,11 @@ mod tests {
             assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
             assert_eq!(resident_store_is_live(&file), loaded.is_some());
             assert_eq!(ivf.storage.resident_columns().loaded_bytes(), loaded);
-            let pool = ivf.storage.lazy_far_permits(&far).unwrap();
-            let held = pool.try_acquire().unwrap();
 
             // Evicted from every tier: the next open reads the files anew.
             tiered.clear().await;
             assert!(dataset.index_cache.get_with_key(&state_key).await.is_none());
-            let reopened = open_and_search(&dataset, &uuid, &query, config)
-                .await
-                .unwrap();
+            let reopened = open_and_search(&dataset, &uuid, &query).await.unwrap();
             // The open found the store gone from the cleared RAM and admitted
             // it again.
             assert_eq!(
@@ -12352,9 +10420,7 @@ mod tests {
             // Evicted from RAM only: the next open reads the state back.
             assert_eq!(tiered.persisted_entries(IvfStateEntryBox::TYPE_ID), 1);
             tiered.ram.clear().await;
-            let read_back = open_and_search(&dataset, &uuid, &query, config)
-                .await
-                .unwrap();
+            let read_back = open_and_search(&dataset, &uuid, &query).await.unwrap();
             assert_eq!(
                 file_cache.peek_resident_with_key(&store_key).await,
                 loaded.is_some()
@@ -12364,17 +10430,12 @@ mod tests {
             for (label, index) in [("reopened", &reopened), ("read back", &read_back)] {
                 let storage = &lazy_index(index).storage;
                 assert_eq!(storage.resident_columns().loaded_bytes(), loaded, "{label}");
-                let permits = storage.lazy_far_permits(&far).unwrap();
-                assert_eq!((permits.size(), permits.in_flight()), (2, 1), "{label}");
             }
-            drop(held);
 
             // The cache holds the store idle, though no index does.
-            drop((old, reopened, read_back, pool));
+            drop((old, reopened, read_back));
             assert_eq!(resident_store_is_live(&file), loaded.is_some());
-            let again = open_and_search(&dataset, &uuid, &query, config)
-                .await
-                .unwrap();
+            let again = open_and_search(&dataset, &uuid, &query).await.unwrap();
             let stats = layered_stats::snapshot_and_reset();
             assert_eq!(stats.resident_columns_read_loads, 0, "{stats:?}");
             let store = lazy_index(&again).storage.resident_columns();
@@ -12712,17 +10773,14 @@ mod tests {
             let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
             let test = ResidentTestIndex::open(dir.as_str(), backend.clone()).await;
             let vectors = batch["vector"].as_fixed_size_list();
-            let lazy = LayeredLazyConfig {
-                enabled: true,
-                ..Default::default()
-            };
+
             let queries: Vec<_> = (0..CONCURRENT_QUERIES)
                 .map(|query| lazy_test_query(vectors.value(query * 97), 10, 8))
                 .collect();
             futures::future::try_join_all(
                 queries
                     .iter()
-                    .map(|query| open_and_search(&test.dataset, &test.uuid, query, lazy)),
+                    .map(|query| open_and_search(&test.dataset, &test.uuid, query)),
             )
             .await
             .unwrap();
@@ -13844,15 +11902,10 @@ mod tests {
             let (_, batch) =
                 write_rq_test_dataset(dir.as_str(), 7, DistanceType::L2, layered).await;
             let key = batch["vector"].as_fixed_size_list().value(777);
-            let mut queries: Vec<(String, Query, LayeredLazyConfig, Arc<dyn PreFilter>)> =
-                Vec::new();
+            let mut queries: Vec<(String, Query, Arc<dyn PreFilter>)> = Vec::new();
             if layered {
-                for (label, query, config) in sign_bounds_test_queries(&key) {
-                    queries.push((label, query, config, Arc::new(NoFilter)));
-                }
-                for (_, config) in lazy_test_configs() {
-                    let query = lazy_test_query(key.clone(), 100, LAZY_PARTITIONS);
-                    queries.push((format!("{config:?}"), query, config, Arc::new(NoFilter)));
+                for (label, query) in sign_bounds_test_queries(&key) {
+                    queries.push((label, query, Arc::new(NoFilter)));
                 }
             } else {
                 for approx_mode in [ApproxMode::Normal, ApproxMode::Accurate] {
@@ -13860,7 +11913,7 @@ mod tests {
                         let mut query = lazy_test_query(key.clone(), 100, 8);
                         query.approx_mode = approx_mode;
                         let label = format!("approx={approx_mode:?} filter={filter_name}");
-                        queries.push((label, query, LayeredLazyConfig::default(), filter));
+                        queries.push((label, query, filter));
                     }
                 }
             }
@@ -13897,16 +11950,15 @@ mod tests {
                         "{context}"
                     );
                     let mut results = Vec::new();
-                    for (label, query, config, filter) in &queries {
-                        ivf.set_layered_lazy_config_for_test(*config);
+                    for (label, query, filter) in &queries {
                         let result = search_global(&index, query, filter.clone()).await;
-                        ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+
                         let result =
                             result.unwrap_or_else(|error| panic!("{context} {label}: {error}"));
                         results.push(result_bits(&result));
                     }
                     assert!(results.iter().any(|(ids, _)| !ids.is_empty()), "{context}");
-                    wait_for_promotions().await;
+
                     let stats = layered_stats::snapshot_and_reset();
                     if entry_columns.resolve(resident) == EntryColumns::Codes {
                         assert!(stats.resident_attach_calls > 0, "{context} {stats:?}");
@@ -13928,14 +11980,7 @@ mod tests {
                         };
                         let gathered = ivf
                             .storage
-                            .gather_ex_rows(
-                                partition,
-                                &rows,
-                                plan,
-                                &LayeredLazyConfig::default(),
-                                &ivf.index_cache,
-                                None,
-                            )
+                            .gather_ex_rows(partition, &rows, plan, None, &ivf.index_cache, None)
                             .await
                             .unwrap();
                         assert_eq!(gathered.sources, [Some(PlaneSource::Sparse); 2]);
@@ -14035,14 +12080,13 @@ mod tests {
         /// entry.
         async fn read_every_way(
             index: &Arc<dyn VectorIndex>,
-            queries: &[(String, Query, LayeredLazyConfig, Arc<dyn PreFilter>)],
+            queries: &[(String, Query, Arc<dyn PreFilter>)],
             label: &str,
         ) {
             let ivf = lazy_index(index);
-            for (name, query, config, filter) in queries {
-                ivf.set_layered_lazy_config_for_test(*config);
+            for (name, query, filter) in queries {
                 let result = search_global(index, query, filter.clone()).await;
-                ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
+
                 result.unwrap_or_else(|error| panic!("{label} {name}: {error}"));
             }
             if ivf.is_layered_rq() {
@@ -14058,14 +12102,7 @@ mod tests {
                         };
                         let gathered = ivf
                             .storage
-                            .gather_ex_rows(
-                                partition,
-                                &rows,
-                                plan,
-                                &LayeredLazyConfig::default(),
-                                &ivf.index_cache,
-                                None,
-                            )
+                            .gather_ex_rows(partition, &rows, plan, None, &ivf.index_cache, None)
                             .await
                             .unwrap();
                         // Gathered rows are copies.
@@ -14077,7 +12114,7 @@ mod tests {
                     }
                 }
             }
-            wait_for_promotions().await;
+
             for partition in 0..LAZY_PARTITIONS {
                 for with_vector in [false, true] {
                     let batches = index
@@ -14202,27 +12239,17 @@ mod tests {
                 .store_views()
                 .expect("the open loaded the store");
 
-            let mut queries: Vec<(String, Query, LayeredLazyConfig, Arc<dyn PreFilter>)> =
-                Vec::new();
+            let mut queries: Vec<(String, Query, Arc<dyn PreFilter>)> = Vec::new();
             if layered {
-                for (name, query, config) in sign_bounds_test_queries(&key) {
-                    queries.push((name, query, config, Arc::new(NoFilter)));
-                }
-                for (_, config) in lazy_test_configs() {
-                    let query = lazy_test_query(key.clone(), 100, LAZY_PARTITIONS);
-                    queries.push((format!("{config:?}"), query, config, Arc::new(NoFilter)));
+                for (name, query) in sign_bounds_test_queries(&key) {
+                    queries.push((name, query, Arc::new(NoFilter)));
                 }
             } else {
                 for approx_mode in [ApproxMode::Normal, ApproxMode::Accurate] {
                     let mut query = lazy_test_query(key.clone(), 100, 8);
                     query.approx_mode = approx_mode;
                     let name = format!("approx={approx_mode:?}");
-                    queries.push((
-                        name,
-                        query,
-                        LayeredLazyConfig::default(),
-                        Arc::new(NoFilter),
-                    ));
+                    queries.push((name, query, Arc::new(NoFilter)));
                 }
             }
             // A prefiltered query caches the whole partitions it probes
@@ -14230,8 +12257,7 @@ mod tests {
             for (name, filter) in lazy_test_filters() {
                 if name == "sparse" || name == "dense" {
                     let query = lazy_test_query(key.clone(), 100, LAZY_PARTITIONS);
-                    let config = LayeredLazyConfig::default();
-                    queries.push((format!("filter={name}"), query, config, filter));
+                    queries.push((format!("filter={name}"), query, filter));
                 }
             }
 
@@ -14774,13 +12800,7 @@ mod tests {
         /// wider one: touching ranges only, V11's S3 block size, the gap
         /// `auto` gives a high-latency origin, the wider 1 MiB it gave
         /// before, and every range of a column page.
-        const COALESCE_TEST_GAPS: [u64; 5] = [
-            0,
-            64 * 1024,
-            HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES,
-            1024 * 1024,
-            u64::MAX,
-        ];
+        const COALESCE_TEST_GAPS: [u64; 5] = [0, 64 * 1024, 256 * 1024, 1024 * 1024, u64::MAX];
         /// Spacing of the single rows of a sparse selection.
         const COALESCE_TEST_ROW_STEP: usize = 41;
 
@@ -14895,227 +12915,6 @@ mod tests {
             }
         }
 
-        /// The lazy scan returns the eager results whatever gap its sparse
-        /// reads of the origin file merge row runs within, whether it reads
-        /// every plane by selected rows or chooses by cost. Every gap counts
-        /// the same origin rows, and reading them, a wider gap makes no more
-        /// origin requests, for no fewer bytes; `auto` on a high-latency
-        /// origin reads as [`HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES`] does.
-        #[rstest]
-        #[case::rq7_l2(7, DistanceType::L2)]
-        #[case::rq9_dot(9, DistanceType::Dot)]
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_origin_gap_parity(
-            #[case] bits: u8,
-            #[case] distance_type: DistanceType,
-        ) {
-            assert!(
-                COALESCE_TEST_GAPS.is_sorted_by(|narrower, wider| narrower < wider),
-                "{COALESCE_TEST_GAPS:?}"
-            );
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), bits, distance_type).await;
-            let vectors = batch["vector"].as_fixed_size_list();
-            let (dataset, index, _) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::Origin).await;
-            let queries: Vec<Query> = [vectors.value(0), vectors.value(777)]
-                .into_iter()
-                .flat_map(|key| {
-                    [(4, 10), (16, 100), (LAZY_PARTITIONS, 1000)]
-                        .map(|(nprobes, k)| lazy_test_query(key.clone(), k, nprobes))
-                })
-                .collect();
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            let gaps = std::iter::once(LazyOriginGap::Auto)
-                .chain(COALESCE_TEST_GAPS.map(LazyOriginGap::Bytes));
-            for origin_gap in gaps {
-                for dense in [DenseGatherMode::Sparse, DenseGatherMode::Cost] {
-                    let config = LayeredLazyConfig {
-                        enabled: true,
-                        dense,
-                        promote: LazyPromotion::Off,
-                        origin_gap,
-                        ..Default::default()
-                    };
-                    let label = format!("{distance_type:?} bits={bits} {origin_gap:?} {dense:?}");
-                    let mut origin_row_reads = 0;
-                    for query in &queries {
-                        let context =
-                            format!("{label} nprobes={} k={}", query.minimum_nprobes, query.k);
-                        let stats =
-                            assert_lazy_matches_eager(&index, query, &filter, config, &context)
-                                .await;
-                        origin_row_reads += stats.origin_row_reads;
-                    }
-                    // Nothing is cached, so every sparse read goes to the origin.
-                    if dense == DenseGatherMode::Sparse {
-                        assert!(origin_row_reads > 0, "{label}");
-                    }
-                }
-            }
-
-            let label = format!("{distance_type:?} bits={bits}");
-            let mut reads = Vec::with_capacity(COALESCE_TEST_GAPS.len());
-            for gap in COALESCE_TEST_GAPS {
-                reads.push(
-                    origin_sparse_reads(&index, &queries, LazyOriginGap::Bytes(gap), &label).await,
-                );
-            }
-            let requests = reads.iter().map(|read| read.requests).collect::<Vec<_>>();
-            let bytes = reads.iter().map(|read| read.bytes).collect::<Vec<_>>();
-            let rows = reads.iter().map(|read| read.rows).collect::<Vec<_>>();
-            // Every gap gathers the same rows, so the rows counted are the
-            // denominator of each gap's byte amplification.
-            let context = format!("{label} requests={requests:?} bytes={bytes:?} rows={rows:?}");
-            assert!(rows[0] > 0, "{context}");
-            assert!(
-                rows.iter().all(|&gap_rows| gap_rows == rows[0]),
-                "{context}"
-            );
-            // Gap 0 merges only touching row runs, and `u64::MAX` every run
-            // of a read.
-            assert!(
-                requests.windows(2).all(|pair| pair[1] <= pair[0]),
-                "{context}"
-            );
-            assert!(bytes.windows(2).all(|pair| pair[1] >= pair[0]), "{context}");
-            // A wider gap merges row runs that are apart, reading the bytes
-            // between them, so it makes fewer requests exactly when it reads
-            // more bytes. Every sparse read of the rq9 Dot data is one run per
-            // column, so only the rq7 L2 data must merge.
-            let last = requests.len() - 1;
-            assert_eq!(
-                requests[0] > requests[last],
-                bytes[0] < bytes[last],
-                "{context}"
-            );
-            if distance_type == DistanceType::L2 {
-                assert!(requests[0] > requests[last], "{context}");
-            }
-
-            let (store, index_dir) = index_files(&dataset).await;
-            let high =
-                open_with_origin_latency(&dataset, store, index_dir, OriginLatencyClass::High)
-                    .await;
-            let auto = origin_sparse_reads(&high, &queries, LazyOriginGap::Auto, &label).await;
-            let fixed = origin_sparse_reads(
-                &high,
-                &queries,
-                LazyOriginGap::Bytes(HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES),
-                &label,
-            )
-            .await;
-            assert!(auto.requests > 0, "{label}: {auto:?}");
-            assert_eq!(auto, fixed, "{label}");
-            assert_eq!(auto.rows, rows[0], "{label}: {auto:?}");
-        }
-
-        /// What the lazy scan's sparse reads of the origin file added up to.
-        #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-        struct OriginSparseReads {
-            /// Requests after coalescing and splitting.
-            requests: u64,
-            /// Bytes read, the gaps between row runs included.
-            bytes: u64,
-            /// Rows gathered.
-            rows: u64,
-        }
-
-        /// The origin requests, bytes and rows of the lazy scan's sparse
-        /// reads over `queries` on `index` with `origin_gap`, each query's
-        /// results checked against the eager scan's. Every lazy probe is
-        /// gathered by selected rows once every earlier probe was scored, so
-        /// the rows each gather reads are the same for every gap. Nothing is
-        /// cached, so the origin serves each survivor's row of both ex planes.
-        async fn origin_sparse_reads(
-            index: &Arc<dyn VectorIndex>,
-            queries: &[Query],
-            origin_gap: LazyOriginGap,
-            label: &str,
-        ) -> OriginSparseReads {
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            let config = LayeredLazyConfig {
-                enabled: true,
-                window: 0,
-                dense: DenseGatherMode::Sparse,
-                promote: LazyPromotion::Off,
-                origin_gap,
-                dense_to_eager: DenseToEager::Off,
-                far_window: 0,
-                ..Default::default()
-            };
-            // A gather reads its survivors' rows of the high and the low plane.
-            const EX_PLANES: u64 = 2;
-            let mut reads = OriginSparseReads::default();
-            for query in queries {
-                let context = format!(
-                    "{label} {origin_gap:?} nprobes={} k={}",
-                    query.minimum_nprobes, query.k
-                );
-                let stats =
-                    assert_lazy_matches_eager(index, query, &filter, config, &context).await;
-                let survivors = stats.rows_fetched.iter().sum::<u64>();
-                assert_eq!(
-                    stats.origin_sparse_rows,
-                    EX_PLANES * survivors,
-                    "{context}: {stats:?}"
-                );
-                reads.requests += stats.origin_sparse_requests;
-                reads.bytes += stats.origin_sparse_bytes;
-                reads.rows += stats.origin_sparse_rows;
-            }
-            reads
-        }
-
-        /// The lazy origin gap is the environment's setting resolved for the
-        /// index's origin, when the index opens and when it is reconstructed
-        /// from the cached state; a replaced setting resolves the same way.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_origin_gap_resolves_at_open() {
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (dataset, index, _) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::Resident).await;
-            let ivf = lazy_index(&index);
-            let block_size = dataset.object_store.block_size() as u64;
-            let setting = LayeredLazyConfig::from_env().unwrap().origin_gap;
-            let expected = setting.resolve(ivf.origin_latency(), block_size);
-            assert_eq!(ivf.lazy_origin_gap_bytes(), expected);
-
-            let uuid = dataset.load_indices().await.unwrap()[0].uuid;
-            let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
-            let state_key =
-                crate::index::IvfIndexStateCacheKey::new(&uuid, frag_reuse_uuid.as_ref());
-            assert!(
-                dataset.index_cache.get_with_key(&state_key).await.is_some(),
-                "the reopen must reconstruct from the cached state"
-            );
-            let reopened = dataset
-                .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
-                .await
-                .unwrap();
-            assert_eq!(lazy_index(&reopened).lazy_origin_gap_bytes(), expected);
-
-            let auto = match ivf.origin_latency() {
-                OriginLatencyClass::High => HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES,
-                OriginLatencyClass::Low => block_size,
-            };
-            for (origin_gap, expected) in [
-                (LazyOriginGap::Auto, auto),
-                (LazyOriginGap::Bytes(0), 0),
-                (LazyOriginGap::Bytes(u64::MAX), u64::MAX),
-            ] {
-                ivf.set_layered_lazy_config_for_test(LayeredLazyConfig {
-                    origin_gap,
-                    ..Default::default()
-                });
-                assert_eq!(ivf.lazy_origin_gap_bytes(), expected, "{origin_gap:?}");
-            }
-            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-        }
-
         /// The object store holding the files of `dataset`'s index, and their
         /// directory.
         async fn index_files(dataset: &Dataset) -> (Arc<ObjectStore>, object_store::path::Path) {
@@ -15124,39 +12923,6 @@ mod tests {
                 dataset.object_store.clone(),
                 dataset.indice_files_dir(&index).unwrap(),
             )
-        }
-
-        /// A copy of the files of `dataset`'s index in an in-memory store
-        /// under an `s3` URL, which `auto` makes a high-latency origin, and
-        /// their directory there.
-        async fn cloud_index_files(
-            dataset: &Dataset,
-        ) -> (Arc<ObjectStore>, object_store::path::Path) {
-            let (local, local_dir) = index_files(dataset).await;
-            let uuid = dataset.load_indices().await.unwrap()[0].uuid.to_string();
-            let store = Arc::new(ObjectStore::new(
-                Arc::new(object_store::memory::InMemory::new()),
-                url::Url::parse("s3://bucket/").unwrap(),
-                None,
-                None,
-                false,
-                true,
-                lance_io::object_store::DEFAULT_CLOUD_IO_PARALLELISM,
-                lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
-                None,
-            ));
-            let dir = object_store::path::Path::from("indices");
-            for file in [lance_index::INDEX_FILE_NAME, INDEX_AUXILIARY_FILE_NAME] {
-                let bytes = local
-                    .read_one_all(&local_dir.clone().join(uuid.as_str()).join(file))
-                    .await
-                    .unwrap();
-                store
-                    .put(&dir.clone().join(uuid.as_str()).join(file), &bytes)
-                    .await
-                    .unwrap();
-            }
-            (store, dir)
         }
 
         /// Open the index of `dataset` from its files in `index_dir` of
@@ -15213,678 +12979,6 @@ mod tests {
                 .await
                 .unwrap();
             Arc::new(ivf)
-        }
-
-        /// Hold the high and low planes of every non-empty partition where
-        /// `tiers` places them: on the persistent tier only for
-        /// [`CacheTier::Local`], nowhere for [`CacheTier::Absent`]. Nothing
-        /// else stays cached.
-        async fn lay_out_ex_planes(
-            index: &Arc<dyn VectorIndex>,
-            tiered: &TieredPlaneTestBackend,
-            tiers: impl Fn(usize) -> [CacheTier; 2],
-        ) {
-            let ivf = lazy_index(index);
-            tiered.clear().await;
-            for partition in 0..LAZY_PARTITIONS {
-                if ivf.storage.partition_size(partition) == 0 {
-                    continue;
-                }
-                for (plane, tier) in [1u8, 2].into_iter().zip(tiers(partition)) {
-                    if tier == CacheTier::Local {
-                        ivf.storage
-                            .load_plane_entry(partition, plane, &ivf.index_cache, None)
-                            .await
-                            .unwrap();
-                    }
-                }
-            }
-            tiered.ram.clear().await;
-        }
-
-        /// Background promotions are off unless set, and `auto` is off for an
-        /// index whose origin latency class is high and after one sparse read
-        /// otherwise. The index resolves the environment's policy when it
-        /// opens and when it is reconstructed from the cached state, and
-        /// resolves a replaced class or setting the same way.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_promotion_resolves_at_open() {
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (dataset, index, _) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::Resident).await;
-            let setting = LayeredLazyConfig::from_env().unwrap().promote;
-            let ivf = lazy_index(&index);
-            let expected = setting.resolve(ivf.origin_latency());
-            assert_ne!(expected, LazyPromotion::Auto);
-            assert_eq!(ivf.layered_lazy_config().promote, expected);
-
-            let uuid = dataset.load_indices().await.unwrap()[0].uuid;
-            let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
-            let state_key =
-                crate::index::IvfIndexStateCacheKey::new(&uuid, frag_reuse_uuid.as_ref());
-            assert!(
-                dataset.index_cache.get_with_key(&state_key).await.is_some(),
-                "the reopen must reconstruct from the cached state"
-            );
-            let reopened = dataset
-                .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
-                .await
-                .unwrap();
-            let reconstructed = lazy_index(&reopened);
-            assert_eq!(reconstructed.layered_lazy_config().promote, expected);
-
-            let (store, index_dir) = index_files(&dataset).await;
-            for class in [OriginLatencyClass::Low, OriginLatencyClass::High] {
-                let auto = match class {
-                    OriginLatencyClass::Low => LazyPromotion::Background { reads: 1 },
-                    OriginLatencyClass::High => LazyPromotion::Off,
-                };
-                let index =
-                    open_with_origin_latency(&dataset, store.clone(), index_dir.clone(), class)
-                        .await;
-                let ivf = lazy_index(&index);
-                assert_eq!(ivf.origin_latency(), class);
-                assert_eq!(ivf.storage.origin_latency(), class);
-                let promote = ivf.layered_lazy_config().promote;
-                assert_eq!(promote, setting.resolve(class), "{class}");
-                for promote in [
-                    LazyPromotion::Auto,
-                    LazyPromotion::Off,
-                    LazyPromotion::Background { reads: 2 },
-                ] {
-                    ivf.set_layered_lazy_config_for_test(LayeredLazyConfig {
-                        promote,
-                        ..Default::default()
-                    });
-                    let expected = if promote == LazyPromotion::Auto {
-                        auto
-                    } else {
-                        promote
-                    };
-                    let resolved = ivf.layered_lazy_config().promote;
-                    assert_eq!(resolved, expected, "{class} {promote}");
-                }
-            }
-        }
-
-        /// With `auto` promotions, an index read from a cloud object store
-        /// gathers sparse rows from it without ever promoting a plane: no read
-        /// reaches the store once a query has returned, and results are the
-        /// eager scan's. The same gathers on a local file, whose class is
-        /// low, promote planes after one read. Both indexes share one ungated
-        /// backend that would admit promoted planes, emptied before every
-        /// query so that each sparse gather reads the origin.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_promotion_follows_origin_latency() {
-            const QUERIES: usize = 3;
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (dataset, _, tiered) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::ColdUngated).await;
-            let tiered = tiered.unwrap();
-            let (cloud_store, cloud_dir) = cloud_index_files(&dataset).await;
-            let cloud = open_rq_index(&dataset, cloud_store.clone(), cloud_dir).await;
-            // `auto` makes the cloud store's class high unless the environment
-            // sets it; pin it high for the promotions below, with the store
-            // `open_with_origin_latency` gives a high twin.
-            let class =
-                OriginLatencyClass::resolve(origin_latency_setting().unwrap(), &cloud_store);
-            assert_eq!(cloud.origin_latency(), class);
-            let cloud = cloud
-                .with_origin_latency_for_test(OriginLatencyClass::High)
-                .unwrap()
-                .with_resident_columns_for_test(twin_keeps_resident_store(OriginLatencyClass::High))
-                .await
-                .unwrap();
-            let cloud: Arc<dyn VectorIndex> = Arc::new(cloud);
-            let (local_store, local_dir) = index_files(&dataset).await;
-            let local = open_with_origin_latency(
-                &dataset,
-                local_store.clone(),
-                local_dir,
-                OriginLatencyClass::Low,
-            )
-            .await;
-
-            let vectors = batch["vector"].as_fixed_size_list();
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            let queries: Vec<Query> = (0..QUERIES)
-                .map(|row| lazy_test_query(vectors.value(row * 101), 100, LAZY_PARTITIONS))
-                .collect();
-            lazy_index(&local).set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-            let mut expected = Vec::with_capacity(QUERIES);
-            for query in &queries {
-                let eager = search_global(&local, query, filter.clone()).await.unwrap();
-                expected.push(result_bits(&eager));
-            }
-            // Promotions are off unless set; `auto` resolves by class.
-            let config = LayeredLazyConfig {
-                enabled: true,
-                dense: DenseGatherMode::Sparse,
-                promote: LazyPromotion::Auto,
-                ..Default::default()
-            };
-            for (index, store, class) in [
-                (&cloud, &cloud_store, OriginLatencyClass::High),
-                (&local, &local_store, OriginLatencyClass::Low),
-            ] {
-                let ivf = lazy_index(index);
-                ivf.set_layered_lazy_config_for_test(config);
-                let promote = ivf.layered_lazy_config().promote;
-                assert_eq!(promote, LazyPromotion::Auto.resolve(class), "{class}");
-                layered_stats::snapshot_and_reset();
-                let mut late_reads = 0;
-                for (query, expected) in queries.iter().zip(&expected) {
-                    tiered.clear().await;
-                    let result = search_global(index, query, filter.clone()).await.unwrap();
-                    assert_eq!(&result_bits(&result), expected, "{class}");
-                    store.io_stats_incremental();
-                    wait_for_promotions().await;
-                    late_reads += store.io_stats_incremental().read_iops;
-                }
-                let stats = layered_stats::snapshot_and_reset();
-                ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-                let context = format!("{class} {stats:?}");
-                assert_eq!(stats.lazy_queries, QUERIES as u64, "{context}");
-                assert_eq!(stats.needed_not_fetched, 0, "{context}");
-                assert!(stats.origin_row_reads > 0, "{context}");
-                match class {
-                    OriginLatencyClass::High => {
-                        assert_eq!(
-                            (stats.promotions_issued, stats.promotion_bytes),
-                            (0, 0),
-                            "{context}"
-                        );
-                        assert_eq!(late_reads, 0, "{context}");
-                    }
-                    OriginLatencyClass::Low => {
-                        assert!(stats.promotions_issued > 0, "{context}");
-                        assert!(stats.promotion_bytes > 0, "{context}");
-                    }
-                }
-            }
-        }
-
-        /// Under `origin`, staging routes a predicted-dense probe only when
-        /// the index's origin is high latency and no cache tier holds its
-        /// high or low plane; `all` routes it wherever its planes are, and
-        /// `off` never does. Before every query the partitions hold both ex
-        /// planes on the persistent tier, only the high plane there, or
-        /// neither anywhere, and nothing in RAM. One query's `k` exceeds every
-        /// probed row, so every probe is predicted dense; the others' first
-        /// probe alone fills the heap, so only that one is.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_dense_to_eager_follows_plane_tiers() {
-            const SMALL_K: usize = 10;
-            const SMALL_K_QUERIES: usize = 4;
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (dataset, _, tiered) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::ColdUngated).await;
-            let tiered = tiered.unwrap();
-            let (store, index_dir) = index_files(&dataset).await;
-            let (low, high) = (OriginLatencyClass::Low, OriginLatencyClass::High);
-            let low_index =
-                open_with_origin_latency(&dataset, store.clone(), index_dir.clone(), low).await;
-            let high_index = open_with_origin_latency(&dataset, store, index_dir, high).await;
-            let (local, absent) = (CacheTier::Local, CacheTier::Absent);
-            let layout = |partition: usize| match partition % 3 {
-                0 => [local, local],
-                1 => [local, absent],
-                _ => [absent, absent],
-            };
-
-            let vectors = batch["vector"].as_fixed_size_list();
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            let every_row = lazy_test_query(vectors.value(0), LAZY_ROWS + 1, LAZY_PARTITIONS);
-            let mut queries = vec![every_row];
-            queries.extend(queries_filled_by_first_probe(
-                &low_index,
-                vectors,
-                SMALL_K,
-                LAZY_PARTITIONS,
-                SMALL_K_QUERIES,
-            ));
-            lazy_index(&low_index).set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-            let mut expected = Vec::with_capacity(queries.len());
-            for query in &queries {
-                let eager = search_global(&low_index, query, filter.clone())
-                    .await
-                    .unwrap();
-                expected.push(result_bits(&eager));
-            }
-
-            // The layout is what the tier checks of a high-latency index see.
-            // Each index lays out its own entries: the high-latency one's
-            // hold their codes alone when its small columns are resident.
-            lay_out_ex_planes(&high_index, &tiered, layout).await;
-            let ivf = lazy_index(&high_index);
-            let cache = &ivf.index_cache;
-            for partition in 0..LAZY_PARTITIONS {
-                if ivf.storage.partition_size(partition) > 0 {
-                    let tiers = [
-                        ivf.storage.plane_tier(partition, 1, cache).await,
-                        ivf.storage.plane_tier(partition, 2, cache).await,
-                    ];
-                    assert_eq!(tiers, layout(partition), "partition {partition}");
-                }
-            }
-
-            for mode in [DenseToEager::Off, DenseToEager::Origin, DenseToEager::All] {
-                for (index, class) in [(&low_index, low), (&high_index, high)] {
-                    let ivf = lazy_index(index);
-                    for (position, (query, eager)) in queries.iter().zip(&expected).enumerate() {
-                        lay_out_ex_planes(index, &tiered, layout).await;
-                        ivf.set_layered_lazy_config_for_test(LayeredLazyConfig {
-                            enabled: true,
-                            promote: LazyPromotion::Off,
-                            dense_to_eager: mode,
-                            ..Default::default()
-                        });
-                        layered_stats::snapshot_and_reset();
-                        let result = search_global(index, query, filter.clone()).await.unwrap();
-                        let stats = layered_stats::snapshot_and_reset();
-                        ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-                        let context = format!("{mode} {class} query={position} {stats:?}");
-                        assert_eq!(&result_bits(&result), eager, "{context}");
-                        assert_eq!(stats.lazy_queries, 1, "{context}");
-                        assert_eq!(stats.needed_not_fetched, 0, "{context}");
-
-                        let (partitions, _) = index.find_partitions(query).unwrap();
-                        let mut routed = [0; RANK_BUCKETS];
-                        let mut slow = [0; RANK_BUCKETS];
-                        for (rank, &partition) in partitions.values().iter().enumerate() {
-                            let partition = partition as usize;
-                            if ivf.storage.partition_size(partition) == 0 {
-                                continue;
-                            }
-                            // A plane on no cache tier is a slow read on a slow origin only.
-                            let reads_slow_origin = class == high && !partition.is_multiple_of(3);
-                            let routes = match mode {
-                                DenseToEager::Off => false,
-                                DenseToEager::Origin => reads_slow_origin,
-                                DenseToEager::All => true,
-                            };
-                            let predicted_dense = query.k > LAZY_ROWS || rank == 0;
-                            let bucket = layered_stats::rank_bucket(rank);
-                            routed[bucket] += u64::from(predicted_dense && routes);
-                            slow[bucket] += u64::from(reads_slow_origin);
-                        }
-                        assert_eq!(stats.dense_to_eager, routed, "{context}");
-                        assert_eq!(stats.s3_bound_probes, slow, "{context}");
-                    }
-                }
-            }
-        }
-
-        /// Only a probe whose high or low plane no cache tier holds, on a
-        /// high-latency origin, may be gathered beyond the ordinary window,
-        /// and only while the far window is wider. Every other gather is
-        /// issued within the ordinary window: on a low-latency origin, with
-        /// every ex plane on the persistent tier, or with the far window no
-        /// wider. Row reads are slowed so that scoring lags the staging of
-        /// later probes, which leaves far gathers room to run ahead. On the
-        /// slow origin far gathers also run ahead for larger `k`, under a
-        /// prefilter and distance bounds, whether gathers wait for the heap to
-        /// fill or not, and while predicted-dense probes are routed to the
-        /// eager scan. Results are the eager scan's in every setting.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_far_window_by_tier() {
-            const PROBES: usize = 32;
-            const SMALL_K: usize = 10;
-            /// Heaps that about one probe fills, and that several probes fill.
-            const WIDE_KS: [usize; 2] = [100, 1000];
-            const QUERIES: usize = 2;
-            const STAGING_STEPS: usize = 8;
-            const WINDOW: usize = 1;
-            const ROW_READ_DELAY: Duration = Duration::from_millis(5);
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (dataset, _, tiered) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::ColdUngated).await;
-            let tiered = tiered.unwrap();
-            let (store, index_dir) = index_files(&dataset).await;
-            let (low, high) = (OriginLatencyClass::Low, OriginLatencyClass::High);
-            let low_index =
-                open_with_origin_latency(&dataset, store.clone(), index_dir.clone(), low).await;
-            let high_index = open_with_origin_latency(&dataset, store, index_dir, high).await;
-            let (local, absent) = (CacheTier::Local, CacheTier::Absent);
-            let mixed = |partition: usize| match partition % 3 {
-                0 => [local, local],
-                1 => [local, absent],
-                _ => [absent, absent],
-            };
-
-            let vectors = batch["vector"].as_fixed_size_list();
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            let queries =
-                queries_filled_by_first_probe(&low_index, vectors, SMALL_K, PROBES, QUERIES);
-            lazy_index(&low_index).set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-            let mut expected = Vec::with_capacity(QUERIES);
-            for query in &queries {
-                let eager = search_global(&low_index, query, filter.clone())
-                    .await
-                    .unwrap();
-                expected.push(result_bits(&eager));
-            }
-            // The same queries with heaps that fill after one probe or
-            // several, without and with a prefilter, and without and with
-            // distance bounds, which keep the heap from filling.
-            let (prefilter_name, prefilter) = lazy_test_filters()
-                .into_iter()
-                .find(|(name, _)| *name == "alternating")
-                .unwrap();
-            let mut wide = Vec::new();
-            for query in &queries {
-                for k in WIDE_KS {
-                    let mut query = query.clone();
-                    query.k = k;
-                    for (filter_name, filter) in [
-                        ("none", filter.clone()),
-                        (prefilter_name, prefilter.clone()),
-                    ] {
-                        let eager = search_global(&low_index, &query, filter.clone())
-                            .await
-                            .unwrap();
-                        let bounded = with_bounds(&query, &eager).unwrap();
-                        let bounded_eager = search_global(&low_index, &bounded, filter.clone())
-                            .await
-                            .unwrap();
-                        wide.push((
-                            query.clone(),
-                            filter_name,
-                            filter.clone(),
-                            result_bits(&eager),
-                        ));
-                        wide.push((bounded, filter_name, filter, result_bits(&bounded_eager)));
-                    }
-                }
-            }
-
-            let far = LayeredLazyConfig {
-                enabled: true,
-                window: WINDOW,
-                dense: DenseGatherMode::Sparse,
-                promote: LazyPromotion::Off,
-                far_window: PROBES,
-                ..Default::default()
-            };
-            let far_off = LayeredLazyConfig {
-                far_window: WINDOW,
-                ..far
-            };
-            tiered.set_row_read_delay(ROW_READ_DELAY);
-            // (setting, index, whether every ex plane is on the persistent
-            // tier, config, whether far gathers may run ahead)
-            for (setting, index, all_local, config, runs_ahead) in [
-                ("low", &low_index, false, far, false),
-                ("high, planes local", &high_index, true, far, false),
-                ("high, far window off", &high_index, false, far_off, false),
-                ("high", &high_index, false, far, true),
-            ] {
-                let ivf = lazy_index(index);
-                ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
-                let mut far_early_issues = 0;
-                let mut staleness_max = 0;
-                for (position, (query, eager)) in queries.iter().zip(&expected).enumerate() {
-                    if all_local {
-                        lay_out_ex_planes(index, &tiered, |_| [local, local]).await;
-                    } else {
-                        lay_out_ex_planes(index, &tiered, mixed).await;
-                    }
-                    ivf.set_layered_lazy_config_for_test(config);
-                    layered_stats::snapshot_and_reset();
-                    let result = search_global(index, query, filter.clone()).await.unwrap();
-                    let stats = layered_stats::snapshot_and_reset();
-                    ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-                    let context = format!("{setting} query={position} {stats:?}");
-                    assert_eq!(&result_bits(&result), eager, "{context}");
-                    assert_eq!(stats.lazy_queries, 1, "{context}");
-                    assert_eq!(stats.needed_not_fetched, 0, "{context}");
-                    assert_lazy_chain_timing(&stats, &context);
-                    // A probe on the slow origin issues at most one far gather.
-                    let slow_probes: u64 = stats.s3_bound_probes.iter().sum();
-                    assert!(stats.far_early_issues <= slow_probes, "{context}");
-                    if !runs_ahead {
-                        assert_eq!(
-                            (stats.far_early_issues, stats.far_permit_waits),
-                            (0, 0),
-                            "{context}"
-                        );
-                        assert!(stats.staleness_max <= WINDOW as u64, "{context}");
-                    }
-                    far_early_issues += stats.far_early_issues;
-                    staleness_max = staleness_max.max(stats.staleness_max);
-                }
-                ivf.set_lazy_prepare_parallelism_for_test(0);
-                if runs_ahead {
-                    assert!(far_early_issues > 0, "{setting}");
-                    assert!(staleness_max > WINDOW as u64, "{setting}: {staleness_max}");
-                }
-            }
-
-            // The wider queries run ahead on the slow origin too: with gathers
-            // issued before the heap fills or held until it does, and with the
-            // predicted-dense probes whose planes are on the slow origin
-            // loaded by the eager scan. Under the cost policy every probe of an
-            // unfiltered, unbounded `k = 1000` query is predicted dense, so
-            // that setting routes some; the sparse policy routes none.
-            // (setting, config, whether it routes probes to the eager scan)
-            let wide_settings = [
-                ("sparse", far, false),
-                (
-                    "sparse, held until the heap fills",
-                    LayeredLazyConfig {
-                        eager_before_full: false,
-                        ..far
-                    },
-                    false,
-                ),
-                (
-                    "cost, dense probes on the slow origin routed",
-                    LayeredLazyConfig {
-                        dense: DenseGatherMode::Cost,
-                        dense_to_eager: DenseToEager::Origin,
-                        ..far
-                    },
-                    true,
-                ),
-            ];
-            let ivf = lazy_index(&high_index);
-            ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
-            for (setting, config, routes) in wide_settings {
-                let mut far_early_issues = 0;
-                let mut routed = 0;
-                for (position, (query, filter_name, filter, eager)) in wide.iter().enumerate() {
-                    lay_out_ex_planes(&high_index, &tiered, mixed).await;
-                    ivf.set_layered_lazy_config_for_test(config);
-                    layered_stats::snapshot_and_reset();
-                    let result = search_global(&high_index, query, filter.clone())
-                        .await
-                        .unwrap();
-                    let stats = layered_stats::snapshot_and_reset();
-                    ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-                    let context = format!(
-                        "{setting} query={position} k={} filter={filter_name} bounds={} {stats:?}",
-                        query.k,
-                        query.upper_bound.is_some()
-                    );
-                    assert_eq!(&result_bits(&result), eager, "{context}");
-                    assert_eq!(stats.lazy_queries, 1, "{context}");
-                    assert_eq!(stats.needed_not_fetched, 0, "{context}");
-                    assert_lazy_chain_timing(&stats, &context);
-                    let slow_probes: u64 = stats.s3_bound_probes.iter().sum();
-                    assert!(stats.far_early_issues <= slow_probes, "{context}");
-                    far_early_issues += stats.far_early_issues;
-                    routed += stats.dense_to_eager.iter().sum::<u64>();
-                }
-                assert!(far_early_issues > 0, "{setting}");
-                assert_eq!(routed > 0, routes, "{setting}: {routed} probes routed");
-            }
-            ivf.set_lazy_prepare_parallelism_for_test(0);
-            tiered.set_row_read_delay(Duration::ZERO);
-        }
-
-        /// Gathers beyond the ordinary window share their index's permits
-        /// across queries: concurrent queries hold at most one at a time with
-        /// one permit and at most four with four, and every permit is back
-        /// once the queries finish or are dropped mid-scan. The pool lives in
-        /// the state the cached index is reconstructed from. Nothing is
-        /// cached, so every probe reads its ex planes from the high-latency
-        /// origin, and row reads are slowed so that gathers overlap.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn test_layered_lazy_far_permits_bound_in_flight() {
-            const PROBES: usize = 32;
-            const SMALL_K: usize = 10;
-            const QUERIES: usize = 3;
-            const STAGING_STEPS: usize = 8;
-            const ROW_READ_DELAY: Duration = Duration::from_millis(5);
-            // Rows of the dropped query: a quarter of the rows, so that the
-            // heap fills only after several probes, with a threshold that
-            // leaves the far gathers after them rows to read.
-            const DROPPED_QUERY_K: usize = LAZY_ROWS / 4;
-            let _serial = LAZY_TEST_LOCK.lock().await;
-            let dir = TempStrDir::default();
-            let (_, batch) = write_lazy_test_dataset(dir.as_str(), 7, DistanceType::L2).await;
-            let (dataset, opened, tiered) =
-                open_lazy_test_index(dir.as_str(), LazyTestCache::ColdUngated).await;
-            let tiered = tiered.unwrap();
-            let one_permit = LayeredLazyConfig {
-                enabled: true,
-                window: 0,
-                dense: DenseGatherMode::Sparse,
-                promote: LazyPromotion::Off,
-                far_window: PROBES,
-                far_inflight: 1,
-                ..Default::default()
-            };
-
-            // A reconstruction of the index shares its pool.
-            let pool = lazy_index(&opened)
-                .storage
-                .lazy_far_permits(&one_permit)
-                .unwrap();
-            let held = pool.try_acquire().unwrap();
-            let uuid = dataset.load_indices().await.unwrap()[0].uuid;
-            let frag_reuse_uuid = dataset.frag_reuse_index_uuid().await;
-            let state_key =
-                crate::index::IvfIndexStateCacheKey::new(&uuid, frag_reuse_uuid.as_ref());
-            assert!(
-                dataset.index_cache.get_with_key(&state_key).await.is_some(),
-                "the reopen must reconstruct from the cached state"
-            );
-            let reopened = dataset
-                .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
-                .await
-                .unwrap();
-            let shared = lazy_index(&reopened)
-                .storage
-                .lazy_far_permits(&one_permit)
-                .unwrap();
-            assert_eq!((shared.size(), shared.in_flight()), (1, 1));
-            assert!(shared.try_acquire().is_none());
-            drop(held);
-            assert_eq!(shared.in_flight(), 0);
-
-            let (store, index_dir) = index_files(&dataset).await;
-            let high = OriginLatencyClass::High;
-            let index = open_with_origin_latency(&dataset, store, index_dir, high).await;
-            let ivf = lazy_index(&index);
-            let vectors = batch["vector"].as_fixed_size_list();
-            let filter: Arc<dyn PreFilter> = Arc::new(NoFilter);
-            let queries = queries_filled_by_first_probe(&index, vectors, SMALL_K, PROBES, QUERIES);
-            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
-            let mut expected = Vec::with_capacity(QUERIES);
-            for query in &queries {
-                let eager = search_global(&index, query, filter.clone()).await.unwrap();
-                expected.push(result_bits(&eager));
-            }
-
-            tiered.set_row_read_delay(ROW_READ_DELAY);
-            ivf.set_lazy_prepare_parallelism_for_test(STAGING_STEPS);
-            for far_inflight in [1, 4] {
-                let config = LayeredLazyConfig {
-                    far_inflight,
-                    ..one_permit
-                };
-                let permits = ivf.storage.lazy_far_permits(&config).unwrap();
-                ivf.set_layered_lazy_config_for_test(config);
-                tiered.clear().await;
-                layered_stats::snapshot_and_reset();
-                let results = futures::future::try_join_all(
-                    queries
-                        .iter()
-                        .map(|query| search_global(&index, query, filter.clone())),
-                )
-                .await
-                .unwrap();
-                let stats = layered_stats::snapshot_and_reset();
-                let context = format!("far_inflight={far_inflight} {stats:?}");
-                for (result, expected) in results.iter().zip(&expected) {
-                    assert_eq!(&result_bits(result), expected, "{context}");
-                }
-                assert_eq!(stats.lazy_queries, QUERIES as u64, "{context}");
-                assert_eq!(stats.needed_not_fetched, 0, "{context}");
-                assert_lazy_chain_timing(&stats, &context);
-                assert!(stats.far_early_issues > 0, "{context}");
-                // Observed as each far gather takes its permit.
-                let most = far_inflight as u64;
-                assert!((1..=most).contains(&stats.far_in_flight_max), "{context}");
-                if far_inflight == 1 {
-                    // The queries' far gathers queue for the one permit, and
-                    // the queue is timed.
-                    assert!(stats.far_permit_waits > 0, "{context}");
-                    assert!(stats.far_permit_wait_ns > 0, "{context}");
-                } else {
-                    assert!(stats.far_in_flight_max > 1, "{context}");
-                }
-                assert_eq!(permits.in_flight(), 0, "{context}");
-            }
-
-            // A query dropped while a far gather holds a permit returns it.
-            // A permit is seen only while its gather reads rows, for the row
-            // read delay: a far gather whose rows the threshold prunes holds
-            // it for no time. The first probe of a query with `SMALL_K` fills
-            // the heap, and whether its threshold leaves any far gather rows
-            // depends on how far staging ran ahead of scoring, so this query
-            // takes a `k` that leaves the far gathers rows to read.
-            let mut dropped = queries[0].clone();
-            dropped.k = DROPPED_QUERY_K;
-            let permits = ivf.storage.lazy_far_permits(&one_permit).unwrap();
-            ivf.set_layered_lazy_config_for_test(one_permit);
-            tiered.clear().await;
-            let permit_taken = async {
-                while permits.in_flight() == 0 {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            };
-            let finished = tokio::select! {
-                result = search_global(&index, &dropped, filter.clone()) => Some(result),
-                () = permit_taken => None,
-            };
-            assert!(
-                finished.is_none(),
-                "the query finished before a far gather took a permit"
-            );
-            for _ in 0..500 {
-                if permits.in_flight() == 0 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert_eq!(
-                permits.in_flight(),
-                0,
-                "a dropped query must return its permits"
-            );
-            tiered.set_row_read_delay(Duration::ZERO);
-            ivf.set_lazy_prepare_parallelism_for_test(0);
-            ivf.set_layered_lazy_config_for_test(LayeredLazyConfig::default());
         }
     }
 
@@ -18344,8 +15438,6 @@ mod tests {
     ))]
     #[tokio::test]
     async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
-        use lance_io::assert_io_eq;
-
         const INDEX_NAME: &str = "my_idx";
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
@@ -18624,7 +15716,6 @@ mod tests {
         #[case] partition_type_id: &'static str,
     ) {
         use crate::utils::test::serializing_cache::SerializingCacheBackend;
-        use lance_io::assert_io_eq;
 
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
