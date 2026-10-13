@@ -31,7 +31,7 @@ use lance_encoding::decoder::FilterExpression;
 use lance_file::reader::{FileReader, ReaderProjection};
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_preserving_layout_async};
 use lance_io::ReadBatchParams;
-use lance_io::object_store::{DEFAULT_CLOUD_IO_PARALLELISM, ObjectStore};
+use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::IoStats;
 use lance_io::spill::SpillStore;
 use lance_linalg::distance::DistanceType;
@@ -39,14 +39,13 @@ use prost::Message;
 use std::{
     any::Any,
     borrow::Cow,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashMap},
     hash::Hash,
     mem::size_of,
     ops::{Deref, DerefMut},
     sync::{Arc, LazyLock, Mutex, OnceLock, Weak},
     time::Instant,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crossbeam_queue::ArrayQueue;
 
@@ -721,254 +720,19 @@ pub(crate) fn shared_by_key<K: Eq + Hash + Clone, V>(
 pub struct PlaneAccessTracker {
     /// Cascade candidate reads, see [`PLANE_PROMOTION_READS`].
     accesses: Arc<Mutex<HashMap<(usize, u8), PlaneAccess>>>,
-    /// Background promotions and far gather permits of the lazy
-    /// full-precision scan.
-    lazy: Arc<LazyPromotionState>,
 }
 
 impl DeepSizeOf for PlaneAccessTracker {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.accesses.deep_size_of_children(context) + self.lazy.deep_size_of_children(context)
+        self.accesses.deep_size_of_children(context)
     }
 }
 
-#[derive(Debug, Default)]
-struct LazyPromotionHistory {
-    /// Sparse gathers of each non-resident `(partition, plane)` since its last promotion.
-    sparse_reads: HashMap<(usize, u8), u32>,
-    in_flight: HashSet<(usize, u8)>,
-}
-
-#[derive(Debug, Default)]
-struct LazyPromotionState {
-    history: Mutex<LazyPromotionHistory>,
-    /// Bounds concurrent promotions; sized by the first promoting query's config.
-    permits: OnceLock<Arc<Semaphore>>,
-    /// Bounds the lazy scan's gathers in flight beyond the ordinary window
-    /// across queries; see [`IvfQuantizationStorage::lazy_far_permits`].
-    far_permits: Mutex<Option<LazyFarPermits>>,
-}
-
-impl DeepSizeOf for LazyPromotionState {
-    fn deep_size_of_children(&self, _: &mut lance_core::deepsize::Context) -> usize {
-        let history = self.history.lock().unwrap_or_else(|e| e.into_inner());
-        history.sparse_reads.capacity() * size_of::<((usize, u8), u32)>()
-            + history.in_flight.capacity() * size_of::<(usize, u8)>()
-    }
-}
-
-/// A started background promotion of one ex plane. Dropping it, when the
-/// promotion finishes or is abandoned, frees its in-flight slot and permit.
-#[derive(Debug)]
-pub struct LazyPromotionTicket {
-    pub partition: usize,
-    pub plane: u8,
-    state: Arc<LazyPromotionState>,
-    _permit: OwnedSemaphorePermit,
-}
-
-impl Drop for LazyPromotionTicket {
-    fn drop(&mut self) {
-        self.state
-            .history
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .in_flight
-            .remove(&(self.partition, self.plane));
-        layered_stats::promotion_finished();
-    }
-}
-
-/// The lazy far gather pools of the open index files, by file and pool size;
-/// see [`LazyFarPermits::for_file`].
-static FAR_PERMIT_POOLS: LazyLock<WeakRegistry<(IndexFileKey, usize), Semaphore>> =
-    LazyLock::new(Default::default);
-
-/// The permits of an index's lazy gathers issued beyond the ordinary window
-/// ([`LAZY_FAR_WINDOW_ENV`]), shared by the index's queries and by the
-/// reconstructions of its cached state, and by every open of its file once
-/// bound to it ([`IvfQuantizationStorage::with_index_file`]). A gather holds
-/// its permit until its reads return; dropping the permit, also when the
-/// gather is cancelled, returns it to the pool.
-#[derive(Debug, Clone)]
-pub struct LazyFarPermits {
-    semaphore: Arc<Semaphore>,
-    /// Permits the pool holds while none is taken.
-    size: usize,
-}
-
-impl LazyFarPermits {
-    /// A pool of `size` permits, at most [`Semaphore::MAX_PERMITS`].
-    pub fn try_new(size: usize) -> Result<Self> {
-        if size > Semaphore::MAX_PERMITS {
-            return Err(Error::invalid_input(format!(
-                "a lazy far gather pool of {size} permits exceeds the {} a pool can hold",
-                Semaphore::MAX_PERMITS
-            )));
-        }
-        Ok(Self {
-            semaphore: Arc::new(Semaphore::new(size)),
-            size,
-        })
-    }
-
-    /// The pool of `size` permits that every open of index file `file` in
-    /// the process shares: the live one while an index, a cached state or a
-    /// taken permit holds it, else a new one. Keyed by size too, so that an
-    /// index whose config sets another size (tests replace it) never draws
-    /// from a pool of the old size.
-    fn for_file(file: &IndexFileKey, size: usize) -> Result<Self> {
-        let new = Self::try_new(size)?;
-        let semaphore = shared_by_key(&FAR_PERMIT_POOLS, &(file.clone(), size), || new.semaphore);
-        Ok(Self { semaphore, size })
-    }
-
-    /// A permit, if one is free now.
-    pub fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
-        self.semaphore.clone().try_acquire_owned().ok()
-    }
-
-    /// Wait until a permit is free and take it. Dropping the future before
-    /// then takes none.
-    pub async fn acquire(&self) -> Result<OwnedSemaphorePermit> {
-        self.semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::internal("the lazy far gather permit pool was closed"))
-    }
-
-    /// Permits the pool holds while none is taken.
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    /// Permits taken now, i.e. gathers issued beyond the ordinary window
-    /// whose reads have not returned.
-    pub fn in_flight(&self) -> usize {
-        // Permits only return to the pool when dropped, so at most `size` are free.
-        self.size - self.semaphore.available_permits()
-    }
-}
-
-/// Enables the lazy layered full-precision scan (`0` or `1`).
-pub const LAZY_FULL_ENV: &str = "LANCE_RQ_LAZY_FULL";
-/// Staleness window W: a gather may be issued while up to W earlier probes are unscored.
-pub const LAZY_WINDOW_ENV: &str = "LANCE_RQ_LAZY_WINDOW";
-/// Ex-plane gather policy: `cost`, `sparse` or `whole`.
-pub const LAZY_DENSE_ENV: &str = "LANCE_RQ_LAZY_DENSE";
-/// Most coalesced row runs a sparse gather may issue per plane.
-pub const LAZY_MAX_RUNS_ENV: &str = "LANCE_RQ_LAZY_MAX_RUNS";
-/// Aligned sparse bytes, as a fraction of the plane, from which a whole read is cheaper.
-pub const LAZY_DENSE_BYTES_FRACTION_ENV: &str = "LANCE_RQ_LAZY_DENSE_BYTES_FRACTION";
-/// Background promotion policy: `off` (default), `auto` or `bg:N` (promote
-/// after N sparse gathers). `auto` is `off` for an
-/// [`OriginLatencyClass::High`] origin and `bg:1` otherwise, resolved when an
-/// index opens (see [`LazyPromotion::resolve`]). The default is `off` on every
-/// origin because the V10 workload measured no gain from promotions on local
-/// NVMe either, at the cost of extra plane reads. Backends that gate plane
-/// admission never promote.
-pub const LAZY_PROMOTE_ENV: &str = "LANCE_RQ_LAZY_PROMOTE";
-/// Most background promotions running at once.
-pub const LAZY_PROMOTE_INFLIGHT_ENV: &str = "LANCE_RQ_LAZY_PROMOTE_INFLIGHT";
-/// Largest survivor count a scoring batch scores on the query task instead of the CPU pool.
-pub const LAZY_INLINE_ROWS_ENV: &str = "LANCE_RQ_LAZY_INLINE_ROWS";
-/// Whether a gather whose window gate opens before the heap holds `k` rows
-/// may be issued then, selecting every accepted row as the eager load does
-/// (`0` or `1`, default `1`). It is issued early when waiting would not save
-/// reads, because the gathers issued once the heap fills are expected to be
-/// dense anyway (large `k`), or when the heap is still not full after the
-/// probes that hold `k` rows were scored (filters), where waiting would issue
-/// the gathers one probe at a time. `0` is an ablation knob: such gathers
-/// wait for the heap to fill or for every earlier probe to be scored. The
-/// large-`k` probes that [`LAZY_DENSE_TO_EAGER_ENV`] routes are scored
-/// eagerly instead and never gathered.
-pub const LAZY_EAGER_BEFORE_FULL_ENV: &str = "LANCE_RQ_LAZY_EAGER_BEFORE_FULL";
-/// Which probes that `k` and the partition sizes predict to be gathered
-/// whole are loaded and scored by the eager scan instead: `off`, `origin`
-/// (default) or `all` (see [`DenseToEager`]; the flag's former `0` and `1`
-/// mean `off` and `all`). A probe is predicted dense when it is scored
-/// before the probes ahead of it can hold `k` rows, so its gather selects
-/// every row, and every probe is when the gathers issued once the heap fills
-/// are expected to read whole planes (large `k`). The eager load reads the
-/// partition's planes together (all at once on backends that do not gate
-/// plane admission), with as many probes in flight as the eager scan
-/// prepares, instead of the sign plane at staging and the ex planes a round
-/// trip later within the gather window. Only queries without a prefilter
-/// (deletions included) or upper distance bound are routed: a gather with an
-/// infinite threshold selects only the accepted rows below the bound, which
-/// the probe's sign plane tells. The `sparse` gather policy
-/// ([`LAZY_DENSE_ENV`]) never reads a whole plane and routes no probe.
-pub const LAZY_DENSE_TO_EAGER_ENV: &str = "LANCE_RQ_LAZY_DENSE_TO_EAGER";
-/// Most coalesced row runs a sparse gather reads from the origin file when the
-/// persistent tier does not hold the plane; with more, it loads (and admits)
-/// the whole plane instead. Unlimited by default, and ignored by backends that
-/// gate plane admission, which would not admit the plane.
-pub const LAZY_ORIGIN_MAX_RUNS_ENV: &str = "LANCE_RQ_LAZY_ORIGIN_MAX_RUNS";
-/// Largest gap in bytes between the row runs of a sparse gather that reads the
-/// origin file, because the persistent tier does not hold the plane, that one
-/// request still spans: `auto` (default) or a byte count. Each run is cut back
-/// out of the request before decoding, so only the requests and the bytes
-/// read change, not the rows returned. `auto` is
-/// [`HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES`] for an [`OriginLatencyClass::High`]
-/// origin and the object store's block size, the gap of every other read,
-/// otherwise (see [`LazyOriginGap`]).
-pub const LAZY_ORIGIN_GAP_BYTES_ENV: &str = "LANCE_RQ_LAZY_ORIGIN_GAP_BYTES";
-/// The gap `auto` gives the sparse origin reads of an
-/// [`OriginLatencyClass::High`] origin. S3 latency per request is about flat
-/// from 60 KiB to 700 KiB, so merging runs up to 256 KiB apart makes about a
-/// third fewer S3 requests than the 64 KiB block size. Lazy scans on S3 were
-/// faster with it than with 1 MiB, which makes fewer requests but reads more
-/// bytes between the runs.
-pub const HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES: u64 = 256 * 1024;
-/// Staleness window of the gathers of probes that read an ex plane from an
-/// [`OriginLatencyClass::High`] origin, because no cache tier held their high
-/// or low plane when they were staged (default 64): such a gather may be
-/// issued while up to this many earlier probes are unscored, instead of
-/// [`LAZY_WINDOW_ENV`]'s. A gather issued beyond the ordinary window holds a
-/// permit of the index's pool ([`LAZY_FAR_INFLIGHT_ENV`]) until its reads
-/// return; when none is free it waits for a permit or for the ordinary
-/// window, whichever comes first, so it is never issued later than without
-/// this window. A value no larger than [`LAZY_WINDOW_ENV`]'s turns it off, and
-/// it never applies to a low-latency origin. Results are the same either way.
-pub const LAZY_FAR_WINDOW_ENV: &str = "LANCE_RQ_LAZY_FAR_WINDOW";
-/// Most gathers of one index, over all its queries, issued beyond the
-/// ordinary window under [`LAZY_FAR_WINDOW_ENV`] whose reads have not
-/// returned (default 64, at least 1). The pool is sized once per index.
-pub const LAZY_FAR_INFLIGHT_ENV: &str = "LANCE_RQ_LAZY_FAR_INFLIGHT";
-/// When the lazy scan publishes the heap's threshold to the gathers once a
-/// lazy probe's survivors first fill the heap to `k` rows: `off` (default)
-/// only once the probe is scored whole, as every other probe publishes, or
-/// `on` as soon as they do, partway through scoring the probe. A gather
-/// waiting for the threshold selects its survivors against the first one
-/// published; a mid-probe threshold is the `k`-th best of the rows scored so
-/// far, looser than the probe's final one, so such a gather reads more rows.
-/// On S3 at 32 concurrent queries, the gathers of probe ranks 1-15 selected
-/// about 80x (k=10) and 30x (k=100) as many rows with `on` as with `off`,
-/// which served 1.49x and 1.32x the queries per second; at one query in
-/// flight the two did not differ. Results are the same either way: the
-/// heap's top never increases, so a later threshold still covers every row
-/// stage 2, pruning on the live heap, scores.
-pub const LAZY_PARTIAL_PUBLISH_ENV: &str = "LANCE_RQ_LAZY_PARTIAL_PUBLISH";
 /// Benchmark knob (`0` or `1`, default `0`): `1` loads a layered partition's
 /// sign plane before its ex planes on backends that do not gate plane
 /// admission too, as gated backends always do, instead of loading all three
 /// planes at once. Read once per process.
 pub const SEQUENTIAL_PLANE_LOADS_ENV: &str = "LANCE_RQ_SEQUENTIAL_PLANE_LOADS";
-
-const DEFAULT_LAZY_WINDOW: usize = 16;
-const DEFAULT_LAZY_MAX_RUNS: usize = 16;
-const DEFAULT_LAZY_DENSE_BYTES_FRACTION: f64 = 0.5;
-const DEFAULT_LAZY_PROMOTE_READS: u32 = 1;
-const DEFAULT_LAZY_PROMOTE_INFLIGHT: usize = 4;
-/// About the rows one ~100µs CPU dispatch would score.
-const DEFAULT_LAZY_INLINE_ROWS: usize = 512;
-/// Every probe of a 64-probe query. On S3, a window of 64 for every gather
-/// cut mean latency to 0.69–0.81x of the ordinary window's at k=100 and
-/// k=1000, while 32 gave MS MARCO no gain.
-const DEFAULT_LAZY_FAR_WINDOW: usize = 64;
-/// As many as Lance's default I/O parallelism for cloud object stores.
-const DEFAULT_LAZY_FAR_INFLIGHT: usize = DEFAULT_CLOUD_IO_PARALLELISM;
 
 /// [`SEQUENTIAL_PLANE_LOADS_ENV`], read once per process.
 static SEQUENTIAL_PLANE_LOADS: LazyLock<std::result::Result<bool, String>> = LazyLock::new(|| {
@@ -1350,348 +1114,10 @@ fn parse_flag(name: &str, value: &str) -> Result<bool> {
     }
 }
 
-/// Page size the gather cost model aligns row runs to, matching the
-/// persistent cache's aligned reads.
-const LAZY_GATHER_PAGE_BYTES: usize = 4096;
-/// Rows closer than this share one read, as in the plane cache codec.
-const LAZY_GATHER_COALESCE_GAP_BYTES: usize = 4096;
-/// Estimated cache envelope and plane header ahead of the first row. It only
-/// shifts page boundaries in the cost estimate.
-const LAZY_GATHER_BODY_OFFSET_BYTES: usize = 64;
 /// Bytes a cached ex-plane row stores besides its codes: add and scale factors.
 const EX_PLANE_FACTOR_BYTES: usize = 2 * size_of::<f32>();
 
-/// How the lazy scan chooses between reading selected ex-plane rows and the whole plane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DenseGatherMode {
-    /// Read the whole plane when the row runs are too many or cover too much
-    /// of it (see [`plan_plane_gather`]).
-    Cost,
-    /// Always read selected rows; no probe is routed to the eager scan
-    /// ([`LAZY_DENSE_TO_EAGER_ENV`]).
-    Sparse,
-    /// Always read the whole plane.
-    Whole,
-}
-
-/// Whether sparse gathers promote whole planes into RAM in the background.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum LazyPromotion {
-    /// [`Self::Off`] for an [`OriginLatencyClass::High`] origin and `bg:1`
-    /// otherwise; see [`Self::resolve`]. An index resolves it when it opens,
-    /// so a scan never sees it (and would promote nothing).
-    Auto,
-    /// Only whole-plane gathers admit planes.
-    #[default]
-    Off,
-    /// Promote a plane after this many sparse gathers of it while not
-    /// resident, on backends that do not gate plane admission.
-    Background { reads: u32 },
-}
-
-impl LazyPromotion {
-    /// The policy of an index whose origin is `class`: [`Self::Auto`]
-    /// resolves, an explicit policy applies whatever the origin.
-    ///
-    /// A promotion reads the whole plane again, from the origin when no
-    /// cache tier holds it, and its admission evicts sign planes that later
-    /// queries then miss. On S3 that costs more origin requests than the
-    /// promoted planes save: without promotions the lazy scan of MS MARCO at
-    /// k=100 made 175 instead of 235 requests per query and read 12.0
-    /// instead of 21.6 MiB.
-    pub fn resolve(self, class: OriginLatencyClass) -> Self {
-        match (self, class) {
-            (Self::Auto, OriginLatencyClass::High) => Self::Off,
-            (Self::Auto, OriginLatencyClass::Low) => Self::Background {
-                reads: DEFAULT_LAZY_PROMOTE_READS,
-            },
-            (policy, _) => policy,
-        }
-    }
-}
-
-/// The knob's spelling of the policy: `auto`, `off` or `bg:N`.
-impl std::fmt::Display for LazyPromotion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Auto => f.write_str("auto"),
-            Self::Off => f.write_str("off"),
-            Self::Background { reads } => write!(f, "bg:{reads}"),
-        }
-    }
-}
-
-/// The value of [`LAZY_DENSE_TO_EAGER_ENV`]: which probes predicted to be
-/// gathered whole, of non-empty partitions whose high and low planes are not
-/// both resident, the eager scan loads and scores instead.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub enum DenseToEager {
-    /// None: every such probe takes the lazy pipeline.
-    Off,
-    /// Those whose high or low plane no cache tier holds on an
-    /// [`OriginLatencyClass::High`] origin, where the eager load saves a
-    /// round trip to the origin (see
-    /// [`OriginLatencyClass::reads_slow_origin`]). Where the planes are
-    /// local, loading them eagerly saves little and delays scoring: routing
-    /// every such probe on NVMe raised the p99 of Coyo k=10000 queries from
-    /// 68.4 to 90.5 ms.
-    #[default]
-    Origin,
-    /// Every one, wherever its planes are.
-    All,
-}
-
-impl DenseToEager {
-    /// Whether a predicted-dense probe of a non-empty partition whose high
-    /// and low planes are in `tiers`, not both resident, is loaded and
-    /// scored by the eager scan on an origin of `class`.
-    pub fn routes(self, class: OriginLatencyClass, tiers: &[CacheTier]) -> bool {
-        match self {
-            Self::Off => false,
-            Self::Origin => class.reads_slow_origin(tiers),
-            Self::All => true,
-        }
-    }
-
-    /// The knob's spelling of the mode: `off`, `origin` or `all`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Origin => "origin",
-            Self::All => "all",
-        }
-    }
-}
-
-impl std::fmt::Display for DenseToEager {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// The value of [`LAZY_ORIGIN_GAP_BYTES_ENV`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum LazyOriginGap {
-    /// [`HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES`] for an
-    /// [`OriginLatencyClass::High`] origin, where every request is a round
-    /// trip; the object store's block size otherwise.
-    #[default]
-    Auto,
-    /// This many bytes, whatever the origin.
-    Bytes(u64),
-}
-
-impl LazyOriginGap {
-    /// The gap within which the sparse origin reads of an index whose origin
-    /// is `class` merge row runs into one request, or `None` for the object
-    /// store's block size, which every other read of the file uses.
-    pub fn coalesce_gap(self, class: OriginLatencyClass) -> Option<u64> {
-        match (self, class) {
-            (Self::Bytes(bytes), _) => Some(bytes),
-            (Self::Auto, OriginLatencyClass::High) => Some(HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES),
-            (Self::Auto, OriginLatencyClass::Low) => None,
-        }
-    }
-
-    /// The gap in bytes for an origin of `class` whose object store merges
-    /// ranges within `block_size` bytes by default.
-    pub fn resolve(self, class: OriginLatencyClass, block_size: u64) -> u64 {
-        self.coalesce_gap(class).unwrap_or(block_size)
-    }
-}
-
-/// Settings of the lazy layered full-precision scan, which bounds every row
-/// from the sign plane and reads the ex planes of the survivors only.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LayeredLazyConfig {
-    pub enabled: bool,
-    /// Probes a gather may run ahead of scoring; see [`LAZY_WINDOW_ENV`],
-    /// and [`Self::far_window`] for gathers that read a slow origin.
-    pub window: usize,
-    pub dense: DenseGatherMode,
-    pub max_runs: usize,
-    pub dense_bytes_fraction: f64,
-    /// See [`LAZY_PROMOTE_ENV`]; an index holds it resolved for its origin.
-    pub promote: LazyPromotion,
-    pub promote_inflight: usize,
-    pub inline_rows: usize,
-    /// See [`LAZY_EAGER_BEFORE_FULL_ENV`].
-    pub eager_before_full: bool,
-    /// See [`LAZY_ORIGIN_MAX_RUNS_ENV`]; `usize::MAX` never falls back.
-    pub origin_max_runs: usize,
-    /// See [`LAZY_ORIGIN_GAP_BYTES_ENV`].
-    pub origin_gap: LazyOriginGap,
-    /// See [`LAZY_DENSE_TO_EAGER_ENV`].
-    pub dense_to_eager: DenseToEager,
-    /// See [`LAZY_FAR_WINDOW_ENV`] and [`Self::active_far_window`].
-    pub far_window: usize,
-    /// See [`LAZY_FAR_INFLIGHT_ENV`].
-    pub far_inflight: usize,
-    /// See [`LAZY_PARTIAL_PUBLISH_ENV`]: `true` publishes the threshold as
-    /// soon as a probe's survivors fill the heap.
-    pub partial_publish: bool,
-}
-
-impl Default for LayeredLazyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            window: DEFAULT_LAZY_WINDOW,
-            dense: DenseGatherMode::Cost,
-            max_runs: DEFAULT_LAZY_MAX_RUNS,
-            dense_bytes_fraction: DEFAULT_LAZY_DENSE_BYTES_FRACTION,
-            promote: LazyPromotion::Off,
-            promote_inflight: DEFAULT_LAZY_PROMOTE_INFLIGHT,
-            inline_rows: DEFAULT_LAZY_INLINE_ROWS,
-            eager_before_full: true,
-            origin_max_runs: usize::MAX,
-            origin_gap: LazyOriginGap::Auto,
-            dense_to_eager: DenseToEager::Origin,
-            far_window: DEFAULT_LAZY_FAR_WINDOW,
-            far_inflight: DEFAULT_LAZY_FAR_INFLIGHT,
-            partial_publish: false,
-        }
-    }
-}
-
-impl LayeredLazyConfig {
-    /// Read the `LANCE_RQ_LAZY_*` variables; unset variables keep their defaults.
-    /// The other knobs are read only when [`LAZY_FULL_ENV`] enables the scan,
-    /// so with it off they are ignored exactly as before the scan existed.
-    pub fn from_env() -> Result<Self> {
-        Self::from_lookup(|name| std::env::var(name).ok())
-    }
-
-    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
-        let invalid = |name: &str, value: &str, expected: &str| {
-            Error::invalid_input(format!("{name}={value:?} is invalid, expected {expected}"))
-        };
-        let count = |name: &str, default: usize, min: usize| -> Result<usize> {
-            let Some(value) = lookup(name) else {
-                return Ok(default);
-            };
-            value
-                .trim()
-                .parse::<usize>()
-                .ok()
-                .filter(|parsed| *parsed >= min)
-                .ok_or_else(|| invalid(name, &value, &format!("an integer >= {min}")))
-        };
-        let mut config = Self::default();
-        if let Some(value) = lookup(LAZY_FULL_ENV) {
-            config.enabled = parse_flag(LAZY_FULL_ENV, &value)?;
-        }
-        if !config.enabled {
-            return Ok(config);
-        }
-        config.window = count(LAZY_WINDOW_ENV, config.window, 0)?;
-        if let Some(value) = lookup(LAZY_DENSE_ENV) {
-            config.dense = match value.trim() {
-                "cost" => DenseGatherMode::Cost,
-                "sparse" => DenseGatherMode::Sparse,
-                "whole" => DenseGatherMode::Whole,
-                _ => return Err(invalid(LAZY_DENSE_ENV, &value, "cost, sparse or whole")),
-            };
-        }
-        config.max_runs = count(LAZY_MAX_RUNS_ENV, config.max_runs, 0)?;
-        if let Some(value) = lookup(LAZY_DENSE_BYTES_FRACTION_ENV) {
-            config.dense_bytes_fraction = value
-                .trim()
-                .parse::<f64>()
-                .ok()
-                .filter(|fraction| fraction.is_finite() && *fraction >= 0.0)
-                .ok_or_else(|| {
-                    invalid(
-                        LAZY_DENSE_BYTES_FRACTION_ENV,
-                        &value,
-                        "a finite number >= 0",
-                    )
-                })?;
-        }
-        if let Some(value) = lookup(LAZY_PROMOTE_ENV) {
-            config.promote = match value.trim() {
-                "auto" => LazyPromotion::Auto,
-                "off" => LazyPromotion::Off,
-                other => other
-                    .strip_prefix("bg:")
-                    .and_then(|reads| reads.parse::<u32>().ok())
-                    .filter(|reads| *reads > 0)
-                    .map(|reads| LazyPromotion::Background { reads })
-                    .ok_or_else(|| {
-                        invalid(LAZY_PROMOTE_ENV, &value, "auto, off or bg:N with N >= 1")
-                    })?,
-            };
-        }
-        config.promote_inflight = count(LAZY_PROMOTE_INFLIGHT_ENV, config.promote_inflight, 1)?;
-        config.inline_rows = count(LAZY_INLINE_ROWS_ENV, config.inline_rows, 0)?;
-        if let Some(value) = lookup(LAZY_EAGER_BEFORE_FULL_ENV) {
-            config.eager_before_full = parse_flag(LAZY_EAGER_BEFORE_FULL_ENV, &value)?;
-        }
-        config.origin_max_runs = count(LAZY_ORIGIN_MAX_RUNS_ENV, config.origin_max_runs, 0)?;
-        if let Some(value) = lookup(LAZY_ORIGIN_GAP_BYTES_ENV) {
-            config.origin_gap = match value.trim() {
-                "auto" => LazyOriginGap::Auto,
-                bytes => bytes
-                    .parse::<u64>()
-                    .map(LazyOriginGap::Bytes)
-                    .map_err(|_| {
-                        invalid(LAZY_ORIGIN_GAP_BYTES_ENV, &value, "auto or a byte count")
-                    })?,
-            };
-        }
-        if let Some(value) = lookup(LAZY_DENSE_TO_EAGER_ENV) {
-            // `0`, `1` and their `false`/`true` spellings are the values of
-            // the former on/off flag.
-            config.dense_to_eager = match value.trim() {
-                "off" | "0" | "false" => DenseToEager::Off,
-                "origin" => DenseToEager::Origin,
-                "all" | "1" | "true" => DenseToEager::All,
-                _ => {
-                    return Err(invalid(
-                        LAZY_DENSE_TO_EAGER_ENV,
-                        &value,
-                        "off, origin or all",
-                    ));
-                }
-            };
-        }
-        config.far_window = count(LAZY_FAR_WINDOW_ENV, config.far_window, 0)?;
-        if let Some(value) = lookup(LAZY_FAR_INFLIGHT_ENV) {
-            // A permit pool holds at most `Semaphore::MAX_PERMITS`.
-            config.far_inflight = value
-                .trim()
-                .parse::<usize>()
-                .ok()
-                .filter(|permits| (1..=Semaphore::MAX_PERMITS).contains(permits))
-                .ok_or_else(|| {
-                    invalid(
-                        LAZY_FAR_INFLIGHT_ENV,
-                        &value,
-                        &format!("an integer from 1 to {}", Semaphore::MAX_PERMITS),
-                    )
-                })?;
-        }
-        if let Some(value) = lookup(LAZY_PARTIAL_PUBLISH_ENV) {
-            config.partial_publish = match value.trim() {
-                "on" => true,
-                "off" => false,
-                _ => return Err(invalid(LAZY_PARTIAL_PUBLISH_ENV, &value, "on or off")),
-            };
-        }
-        Ok(config)
-    }
-
-    /// The staleness window of the gathers of probes that read an ex plane
-    /// from an origin of `class`, [`Self::far_window`] when it applies, or
-    /// `None` when they keep [`Self::window`]: the origin is not
-    /// [`OriginLatencyClass::High`], or the far window is no wider.
-    pub fn active_far_window(&self, class: OriginLatencyClass) -> Option<usize> {
-        (class == OriginLatencyClass::High && self.far_window > self.window)
-            .then_some(self.far_window)
-    }
-}
-
-/// Where the lazy scan reads one ex plane of a partition from.
+/// Where to read an ex plane of a partition from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaneSource {
     /// The RAM-resident entry, read like a native memory hit. Falls back to
@@ -1709,8 +1135,7 @@ pub enum PlaneSource {
 pub struct GatherPlan {
     pub planes: [PlaneSource; 2],
     /// Per plane, whether a [`PlaneSource::Sparse`] read that the persistent
-    /// tier cannot serve loads the whole plane (see
-    /// [`origin_reads_whole_plane`]) instead of reading the rows from the
+    /// tier cannot serve loads the whole plane instead of reading rows from the
     /// origin file. Backends that gate plane admission ignore it: they would
     /// read the whole plane without admitting it, so every query would pay
     /// for it again.
@@ -1724,75 +1149,6 @@ pub struct LayeredExLayout {
     pub num_bits: u8,
     /// Persistent-cache bytes per row of the high and low planes (codes plus factors).
     pub row_bytes: [usize; 2],
-}
-
-/// Choose a sparse or whole read of one non-resident ex plane for sorted,
-/// unique `rows` of a partition with `partition_rows` rows.
-///
-/// Rows are grouped into runs with the plane cache codec's gap rule and each
-/// run is rounded out to whole pages. The plane is read whole when that takes
-/// more than `max_runs` runs, or when the pages cover at least
-/// `dense_bytes_fraction` of the plane.
-pub fn plan_plane_gather(
-    rows: &[u32],
-    partition_rows: usize,
-    row_bytes: usize,
-    config: &LayeredLazyConfig,
-) -> PlaneSource {
-    match config.dense {
-        DenseGatherMode::Sparse => return PlaneSource::Sparse,
-        DenseGatherMode::Whole => return PlaneSource::Whole,
-        DenseGatherMode::Cost => {}
-    }
-    let (runs, pages) = sparse_read_extent(rows, row_bytes);
-    let plane_bytes = LAZY_GATHER_BODY_OFFSET_BYTES + partition_rows * row_bytes;
-    if runs > config.max_runs
-        || (pages * LAZY_GATHER_PAGE_BYTES) as f64
-            >= config.dense_bytes_fraction * plane_bytes as f64
-    {
-        PlaneSource::Whole
-    } else {
-        PlaneSource::Sparse
-    }
-}
-
-/// Whether a sparse read of sorted, unique `rows` that the persistent tier
-/// cannot serve should load the whole plane instead of reading the rows from
-/// the origin file: when the rows take more than
-/// [`LayeredLazyConfig::origin_max_runs`] runs (grouped as in
-/// [`plan_plane_gather`]).
-pub fn origin_reads_whole_plane(
-    rows: &[u32],
-    row_bytes: usize,
-    config: &LayeredLazyConfig,
-) -> bool {
-    config.origin_max_runs != usize::MAX
-        && sparse_read_extent(rows, row_bytes).0 > config.origin_max_runs
-}
-
-/// Row runs and pages of a sparse read of sorted, unique `rows`: rows closer
-/// than the plane cache codec's gap share a run, and every run is rounded out
-/// to whole pages.
-fn sparse_read_extent(rows: &[u32], row_bytes: usize) -> (usize, usize) {
-    let gap_rows = LAZY_GATHER_COALESCE_GAP_BYTES / row_bytes.max(1);
-    let page =
-        |row: usize| (LAZY_GATHER_BODY_OFFSET_BYTES + row * row_bytes) / LAZY_GATHER_PAGE_BYTES;
-    let page_end = |row: usize| {
-        (LAZY_GATHER_BODY_OFFSET_BYTES + row * row_bytes).div_ceil(LAZY_GATHER_PAGE_BYTES)
-    };
-    let mut runs = 0usize;
-    let mut pages = 0usize;
-    let mut start = 0;
-    while start < rows.len() {
-        let mut end = start + 1;
-        while end < rows.len() && (rows[end] - rows[end - 1] - 1) as usize <= gap_rows {
-            end += 1;
-        }
-        pages += page_end(rows[end - 1] as usize + 1) - page(rows[start] as usize);
-        runs += 1;
-        start = end;
-    }
-    (runs, pages)
 }
 
 /// The file rows of the partition rows `range`: all of them, or the sorted
@@ -1826,8 +1182,6 @@ pub struct GatheredEx {
     pub sources: [Option<PlaneSource>; 2],
     /// Planes whose sparse rows came from the origin file.
     pub origin_row_reads: usize,
-    /// Background promotions the caller must run (and then drop).
-    pub promotions: Vec<LazyPromotionTicket>,
 }
 
 /// One ex plane fetched for a gather.
@@ -1835,7 +1189,6 @@ struct FetchedPlane {
     batch: RecordBatch,
     source: PlaneSource,
     from_origin: bool,
-    promotion: Option<LazyPromotionTicket>,
 }
 
 /// Planes of a layered partition that have a cache entry: sign, high, low
@@ -2297,35 +1650,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         cache
             .peek_tier_with_key(&self.plane_key(partition, plane))
             .await
-    }
-
-    /// The permits of the lazy scan's gathers issued beyond the ordinary
-    /// window ([`LAZY_FAR_WINDOW_ENV`]), `config.far_inflight` of them,
-    /// shared by every query of this index and by the reconstructions of its
-    /// cached state, and, once bound to its file ([`Self::with_index_file`]),
-    /// by every open of the file in the process. The plane access tracker
-    /// keeps the pool, so a cached state holds it. An index's config is
-    /// fixed when it opens, so it keeps one pool; a config of another size
-    /// (tests replace it) takes another pool, and gathers holding the old
-    /// one's permits return them there.
-    pub fn lazy_far_permits(&self, config: &LayeredLazyConfig) -> Result<LazyFarPermits> {
-        let size = config.far_inflight;
-        let mut pool = self
-            .plane_access
-            .lazy
-            .far_permits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        match pool.as_ref() {
-            Some(permits) if permits.size() == size => Ok(permits.clone()),
-            _ => {
-                let permits = match &self.index_file {
-                    Some(file) => LazyFarPermits::for_file(file, size)?,
-                    None => LazyFarPermits::try_new(size)?,
-                };
-                Ok(pool.insert(permits).clone())
-            }
-        }
     }
 
     pub fn reader(&self) -> &FileReader {
@@ -3023,7 +2347,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         part_id: usize,
         rows: &[u32],
         plan: GatherPlan,
-        config: &LayeredLazyConfig,
+        coalesce_gap: Option<u64>,
         cache: &WeakLanceCache,
         io_stats: Option<IoStats>,
     ) -> Result<GatheredEx> {
@@ -3048,7 +2372,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 index: ExIndex::Compact,
                 sources: [None; 2],
                 origin_row_reads: 0,
-                promotions: Vec::new(),
             });
         }
         let (high, low) = futures::try_join!(
@@ -3058,7 +2381,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 rows,
                 plan.planes[0],
                 plan.origin_whole[0],
-                config,
+                coalesce_gap,
                 cache,
                 io_stats.clone()
             ),
@@ -3068,7 +2391,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 rows,
                 plan.planes[1],
                 plan.origin_whole[1],
-                config,
+                coalesce_gap,
                 cache,
                 io_stats
             ),
@@ -3092,10 +2415,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             index,
             sources: [Some(high.source), Some(low.source)],
             origin_row_reads: usize::from(high.from_origin) + usize::from(low.from_origin),
-            promotions: [high.promotion, low.promotion]
-                .into_iter()
-                .flatten()
-                .collect(),
         })
     }
 
@@ -3109,7 +2428,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         rows: &[u32],
         source: PlaneSource,
         origin_whole: bool,
-        config: &LayeredLazyConfig,
+        coalesce_gap: Option<u64>,
         cache: &WeakLanceCache,
         io_stats: Option<IoStats>,
     ) -> Result<FetchedPlane> {
@@ -3127,7 +2446,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 batch,
                 source: PlaneSource::Resident,
                 from_origin: false,
-                promotion: None,
             });
         }
         if source == PlaneSource::Sparse {
@@ -3147,8 +2465,14 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                     ),
                     // An origin read returns every column of the plane.
                     None => (
-                        self.read_origin_rows(part_id, plane, rows, config, io_stats.as_ref())
-                            .await?,
+                        self.read_origin_rows(
+                            part_id,
+                            plane,
+                            rows,
+                            coalesce_gap,
+                            io_stats.as_ref(),
+                        )
+                        .await?,
                         true,
                     ),
                 };
@@ -3164,7 +2488,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                     batch,
                     source: PlaneSource::Sparse,
                     from_origin,
-                    promotion: self.request_lazy_promotion(part_id, plane, config, cache),
                 });
             }
             // Too many origin row runs: load the whole plane instead, which
@@ -3178,60 +2501,6 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             batch,
             source: PlaneSource::Whole,
             from_origin: false,
-            promotion: None,
-        })
-    }
-
-    /// Record a sparse gather of a non-resident plane and, once the policy's
-    /// read count is reached, start a promotion unless one for the plane is
-    /// already running or every in-flight permit is taken.
-    ///
-    /// A gated backend admits ex planes only behind their resident sign
-    /// plane and evicts the lowest-priority plane first, so a promoted plane
-    /// would mostly be read whole and dropped again; promotions run only on
-    /// backends that admit planes through their ordinary policy.
-    fn request_lazy_promotion(
-        &self,
-        part_id: usize,
-        plane: u8,
-        config: &LayeredLazyConfig,
-        cache: &WeakLanceCache,
-    ) -> Option<LazyPromotionTicket> {
-        let LazyPromotion::Background { reads } = config.promote else {
-            return None;
-        };
-        if cache.plane_admission_gated() {
-            return None;
-        }
-        let stats = layered_stats::counters();
-        let state = &self.plane_access.lazy;
-        let key = (part_id, plane);
-        let mut history = state.history.lock().unwrap_or_else(|e| e.into_inner());
-        if history.in_flight.contains(&key) {
-            stats.promotions_deduped.incr();
-            return None;
-        }
-        let count = history.sparse_reads.entry(key).or_default();
-        *count = count.saturating_add(1);
-        if *count < reads {
-            return None;
-        }
-        let permits = state
-            .permits
-            .get_or_init(|| Arc::new(Semaphore::new(config.promote_inflight)));
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
-            stats.promotions_skipped.incr();
-            return None;
-        };
-        history.sparse_reads.remove(&key);
-        history.in_flight.insert(key);
-        stats.promotions_issued.incr();
-        layered_stats::promotion_started();
-        Some(LazyPromotionTicket {
-            partition: part_id,
-            plane,
-            state: state.clone(),
-            _permit: permit,
         })
     }
 
@@ -3455,7 +2724,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         part_id: usize,
         plane: u8,
         rows: &[u32],
-        config: &LayeredLazyConfig,
+        coalesce_gap: Option<u64>,
         io_stats: Option<&IoStats>,
     ) -> Result<RecordBatch> {
         let origin = IoStats::new();
@@ -3464,7 +2733,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 part_id,
                 plane,
                 Some(rows.to_vec()),
-                config.origin_gap.coalesce_gap(self.origin_latency),
+                coalesce_gap,
                 Some(&origin),
                 io_stats,
             )
@@ -4032,31 +3301,24 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_ENTRY_COLUMNS, DenseGatherMode, DenseToEager, ENTRY_COLUMNS_ENV, EntryColumns,
-        HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES, IndexFileKey, LAZY_DENSE_BYTES_FRACTION_ENV,
-        LAZY_DENSE_ENV, LAZY_DENSE_TO_EAGER_ENV, LAZY_EAGER_BEFORE_FULL_ENV, LAZY_FAR_INFLIGHT_ENV,
-        LAZY_FAR_WINDOW_ENV, LAZY_FULL_ENV, LAZY_INLINE_ROWS_ENV, LAZY_MAX_RUNS_ENV,
-        LAZY_ORIGIN_GAP_BYTES_ENV, LAZY_ORIGIN_MAX_RUNS_ENV, LAZY_PARTIAL_PUBLISH_ENV,
-        LAZY_PROMOTE_ENV, LAZY_PROMOTE_INFLIGHT_ENV, LAZY_WINDOW_ENV, LayeredLazyConfig,
-        LazyFarPermits, LazyOriginGap, LazyPromotion, ORIGIN_LATENCY_ENV, OriginLatencyClass,
-        PlaneSource, QueryScratchCapacity, QueryScratchPool, RESIDENT_COLUMNS_ENV,
+        DEFAULT_ENTRY_COLUMNS, ENTRY_COLUMNS_ENV, EntryColumns, ORIGIN_LATENCY_ENV,
+        OriginLatencyClass, QueryScratchCapacity, QueryScratchPool, RESIDENT_COLUMNS_ENV,
         RESIDENT_LIFETIME_ENV, ResidentColumnsSetting, ResidentLifetime, ResidentStoreSize,
         SEQUENTIAL_PLANE_LOADS_ENV, SIGN_BOUNDS_ENV, SignBounds, compact_prewarm_batches,
         entry_columns_from, entry_columns_setting, origin_latency_from, origin_latency_setting,
-        origin_reads_whole_plane, plan_plane_gather, resident_columns_from,
-        resident_columns_setting, resident_lifetime_from, resident_lifetime_setting,
-        resident_store_fits, sequential_plane_loads, sequential_plane_loads_from, sign_bounds_from,
-        sign_bounds_setting, spawn_prewarm_materialization,
+        resident_columns_from, resident_columns_setting, resident_lifetime_from,
+        resident_lifetime_setting, resident_store_fits, sequential_plane_loads,
+        sequential_plane_loads_from, sign_bounds_from, sign_bounds_setting,
+        spawn_prewarm_materialization,
     };
     use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
-    use futures::FutureExt;
+
     use lance_core::Error;
-    use lance_core::cache::CacheTier;
+
     use lance_core::deepsize::DeepSizeOf;
     use lance_io::object_store::ObjectStore;
-    use std::collections::HashMap;
+
     use std::sync::Arc;
-    use tokio::sync::Semaphore;
 
     #[tokio::test]
     async fn test_prewarm_materialization_uses_cpu_pool() {
@@ -4202,484 +3464,6 @@ mod tests {
         let _checked_out = pool.scratch();
 
         assert_eq!(pool.deep_size_of(), idle_size);
-    }
-
-    #[test]
-    fn test_layered_lazy_config_parses_every_knob() {
-        let env = HashMap::from([
-            (LAZY_FULL_ENV, "1"),
-            (LAZY_WINDOW_ENV, "4"),
-            (LAZY_DENSE_ENV, "sparse"),
-            (LAZY_MAX_RUNS_ENV, "0"),
-            (LAZY_DENSE_BYTES_FRACTION_ENV, "0.25"),
-            (LAZY_PROMOTE_ENV, "bg:2"),
-            (LAZY_PROMOTE_INFLIGHT_ENV, "8"),
-            (LAZY_INLINE_ROWS_ENV, "0"),
-            (LAZY_EAGER_BEFORE_FULL_ENV, "0"),
-            (LAZY_ORIGIN_MAX_RUNS_ENV, "5"),
-            (LAZY_ORIGIN_GAP_BYTES_ENV, " 65536 "),
-            (LAZY_DENSE_TO_EAGER_ENV, "0"),
-            (LAZY_FAR_WINDOW_ENV, "8"),
-            (LAZY_FAR_INFLIGHT_ENV, " 2 "),
-            (LAZY_PARTIAL_PUBLISH_ENV, " on "),
-        ]);
-        let config =
-            LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
-                .unwrap();
-        assert_eq!(
-            config,
-            LayeredLazyConfig {
-                enabled: true,
-                window: 4,
-                dense: DenseGatherMode::Sparse,
-                max_runs: 0,
-                dense_bytes_fraction: 0.25,
-                promote: LazyPromotion::Background { reads: 2 },
-                promote_inflight: 8,
-                inline_rows: 0,
-                eager_before_full: false,
-                origin_max_runs: 5,
-                origin_gap: LazyOriginGap::Bytes(65536),
-                dense_to_eager: DenseToEager::Off,
-                far_window: 8,
-                far_inflight: 2,
-                partial_publish: true,
-            }
-        );
-        assert_eq!(
-            LayeredLazyConfig::from_lookup(|_| None).unwrap(),
-            LayeredLazyConfig::default()
-        );
-        assert!(!LayeredLazyConfig::default().enabled);
-        assert!(LayeredLazyConfig::default().eager_before_full);
-        assert_eq!(LayeredLazyConfig::default().origin_max_runs, usize::MAX);
-        assert_eq!(LayeredLazyConfig::default().promote, LazyPromotion::Off);
-        assert_eq!(
-            LayeredLazyConfig::default().dense_to_eager,
-            DenseToEager::Origin
-        );
-        assert!(!LayeredLazyConfig::default().partial_publish);
-        let env = HashMap::from([(LAZY_FULL_ENV, "1"), (LAZY_PARTIAL_PUBLISH_ENV, "off")]);
-        assert_eq!(
-            LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
-                .unwrap(),
-            LayeredLazyConfig {
-                enabled: true,
-                ..Default::default()
-            }
-        );
-        // The origin run cap does not depend on the eager-before-full switch,
-        // and dense probes whose planes are on a slow origin go to the eager
-        // scan unless set otherwise.
-        let env = HashMap::from([(LAZY_FULL_ENV, "1"), (LAZY_ORIGIN_MAX_RUNS_ENV, "2")]);
-        let config =
-            LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
-                .unwrap();
-        assert_eq!(
-            (
-                config.eager_before_full,
-                config.origin_max_runs,
-                config.dense_to_eager
-            ),
-            (true, 2, DenseToEager::Origin)
-        );
-        let env = HashMap::from([(LAZY_FULL_ENV, "1"), (LAZY_DENSE_TO_EAGER_ENV, "false")]);
-        let config =
-            LayeredLazyConfig::from_lookup(|name| env.get(name).map(|value| value.to_string()))
-                .unwrap();
-        assert_eq!(
-            config,
-            LayeredLazyConfig {
-                enabled: true,
-                dense_to_eager: DenseToEager::Off,
-                ..Default::default()
-            }
-        );
-        let error =
-            LayeredLazyConfig::from_lookup(|key| (key == LAZY_FULL_ENV).then(|| "yes".into()))
-                .unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-        assert!(error.to_string().contains(LAZY_FULL_ENV), "{error}");
-        for (name, value) in [
-            (LAZY_DENSE_ENV, "dense"),
-            (LAZY_PROMOTE_ENV, "bg:0"),
-            (LAZY_PROMOTE_ENV, "on"),
-            (LAZY_PROMOTE_INFLIGHT_ENV, "0"),
-            (LAZY_DENSE_BYTES_FRACTION_ENV, "-1"),
-            (LAZY_WINDOW_ENV, "many"),
-            (LAZY_EAGER_BEFORE_FULL_ENV, "on"),
-            (LAZY_ORIGIN_MAX_RUNS_ENV, "-1"),
-            (LAZY_ORIGIN_GAP_BYTES_ENV, "1MiB"),
-            (LAZY_ORIGIN_GAP_BYTES_ENV, "-1"),
-            (LAZY_DENSE_TO_EAGER_ENV, "2"),
-            (LAZY_DENSE_TO_EAGER_ENV, "on"),
-            (LAZY_FAR_WINDOW_ENV, "wide"),
-            (LAZY_FAR_INFLIGHT_ENV, "0"),
-            (LAZY_PARTIAL_PUBLISH_ENV, "1"),
-            (LAZY_PARTIAL_PUBLISH_ENV, "partial"),
-        ] {
-            let enabled = |key: &str| -> Option<String> {
-                if key == LAZY_FULL_ENV {
-                    Some("1".into())
-                } else {
-                    (key == name).then(|| value.into())
-                }
-            };
-            let error = LayeredLazyConfig::from_lookup(enabled).unwrap_err();
-            assert!(
-                matches!(error, Error::InvalidInput { .. }),
-                "{name}={value}"
-            );
-            assert!(error.to_string().contains(name), "{error}");
-            // With the scan off (unset or 0) the other knobs are ignored.
-            for full in [None, Some("0")] {
-                let disabled = |key: &str| -> Option<String> {
-                    if key == LAZY_FULL_ENV {
-                        full.map(String::from)
-                    } else {
-                        (key == name).then(|| value.into())
-                    }
-                };
-                assert_eq!(
-                    LayeredLazyConfig::from_lookup(disabled).unwrap(),
-                    LayeredLazyConfig::default(),
-                    "{name}={value} with {LAZY_FULL_ENV}={full:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_plan_plane_gather_cost_rule() {
-        // 520-byte rows: rows at most 7 apart share one run.
-        let row_bytes = 520;
-        let config = LayeredLazyConfig {
-            max_runs: 2,
-            dense_bytes_fraction: 0.5,
-            ..Default::default()
-        };
-        assert_eq!(
-            plan_plane_gather(&[10, 17, 24], 2000, row_bytes, &config),
-            PlaneSource::Sparse
-        );
-        assert_eq!(
-            plan_plane_gather(&[10, 100, 1000], 2000, row_bytes, &config),
-            PlaneSource::Whole,
-            "three runs exceed max_runs"
-        );
-        assert_eq!(
-            plan_plane_gather(&(0..1200).collect::<Vec<_>>(), 2000, row_bytes, &config),
-            PlaneSource::Whole,
-            "one run covering most of the plane"
-        );
-        for (dense, expected) in [
-            (DenseGatherMode::Sparse, PlaneSource::Sparse),
-            (DenseGatherMode::Whole, PlaneSource::Whole),
-        ] {
-            let config = LayeredLazyConfig { dense, ..config };
-            assert_eq!(
-                plan_plane_gather(&[10, 100, 1000], 2000, row_bytes, &config),
-                expected
-            );
-            assert_eq!(plan_plane_gather(&[10], 2000, row_bytes, &config), expected);
-        }
-    }
-
-    #[test]
-    fn test_origin_reads_whole_plane_counts_row_runs() {
-        // 520-byte rows: rows at most 7 apart share one run.
-        let row_bytes = 520;
-        let two_runs = [10, 17, 100];
-        let three_runs = [10, 100, 1000];
-        // Unlimited by default: origin rows are read whatever their runs.
-        let unlimited = LayeredLazyConfig::default();
-        assert!(!origin_reads_whole_plane(
-            &three_runs,
-            row_bytes,
-            &unlimited
-        ));
-        let capped = LayeredLazyConfig {
-            origin_max_runs: 2,
-            ..unlimited
-        };
-        assert!(!origin_reads_whole_plane(&two_runs, row_bytes, &capped));
-        assert!(origin_reads_whole_plane(&three_runs, row_bytes, &capped));
-        // The cap applies whether gathers before the heap fills are deferred.
-        let deferred = LayeredLazyConfig {
-            eager_before_full: false,
-            ..capped
-        };
-        assert!(origin_reads_whole_plane(&three_runs, row_bytes, &deferred));
-        let none = LayeredLazyConfig {
-            origin_max_runs: 0,
-            ..unlimited
-        };
-        assert!(origin_reads_whole_plane(&[10], row_bytes, &none));
-        assert!(!origin_reads_whole_plane(&[], row_bytes, &none));
-    }
-
-    #[test]
-    fn test_lazy_origin_gap_knob() {
-        let parse = |gap: &str| {
-            LayeredLazyConfig::from_lookup(|key| match key {
-                LAZY_FULL_ENV => Some("1".to_string()),
-                LAZY_ORIGIN_GAP_BYTES_ENV => Some(gap.to_string()),
-                _ => None,
-            })
-            .map(|config| config.origin_gap)
-        };
-        let defaults = LayeredLazyConfig::default();
-        assert_eq!(defaults.origin_gap, LazyOriginGap::Auto);
-        assert_eq!(parse(" auto ").unwrap(), LazyOriginGap::Auto);
-        for bytes in [0, 64 * 1024, 256 * 1024, 1024 * 1024, u64::MAX] {
-            assert_eq!(
-                parse(&bytes.to_string()).unwrap(),
-                LazyOriginGap::Bytes(bytes)
-            );
-        }
-        for value in ["max", "AUTO", "64k", "256k", "-1", ""] {
-            let error = parse(value).unwrap_err();
-            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-            let message = error.to_string();
-            assert!(message.contains(LAZY_ORIGIN_GAP_BYTES_ENV), "{error}");
-            assert!(message.contains(&format!("{value:?}")), "{error}");
-        }
-        // `auto` widens the gap only where every request is a round trip and
-        // keeps the object store's block size elsewhere; a byte count is the
-        // gap whatever the origin.
-        let block_size = 4096;
-        let classes = [OriginLatencyClass::Low, OriginLatencyClass::High];
-        assert_eq!(
-            classes.map(|class| LazyOriginGap::Auto.coalesce_gap(class)),
-            [None, Some(HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES)]
-        );
-        assert_eq!(
-            classes.map(|class| LazyOriginGap::Auto.resolve(class, block_size)),
-            [block_size, HIGH_LATENCY_LAZY_ORIGIN_GAP_BYTES]
-        );
-        for bytes in [0, 64 * 1024, 256 * 1024, 1024 * 1024, u64::MAX] {
-            let gap = LazyOriginGap::Bytes(bytes);
-            assert_eq!(
-                classes.map(|class| gap.coalesce_gap(class)),
-                [Some(bytes); 2]
-            );
-            assert_eq!(
-                classes.map(|class| gap.resolve(class, block_size)),
-                [bytes; 2]
-            );
-        }
-    }
-
-    #[test]
-    fn test_lazy_promote_knob() {
-        let parse = |promote: &str| {
-            LayeredLazyConfig::from_lookup(|key| match key {
-                LAZY_FULL_ENV => Some("1".to_string()),
-                LAZY_PROMOTE_ENV => Some(promote.to_string()),
-                _ => None,
-            })
-            .map(|config| config.promote)
-        };
-        assert_eq!(LayeredLazyConfig::default().promote, LazyPromotion::Off);
-        for (value, expected) in [
-            (" auto ", LazyPromotion::Auto),
-            ("off", LazyPromotion::Off),
-            ("bg:1", LazyPromotion::Background { reads: 1 }),
-            ("bg:3", LazyPromotion::Background { reads: 3 }),
-        ] {
-            assert_eq!(parse(value).unwrap(), expected, "{value:?}");
-        }
-        for value in ["AUTO", "on", "bg:", "bg:0", "bg:-1", ""] {
-            let error = parse(value).unwrap_err();
-            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-            let message = error.to_string();
-            assert!(message.contains(LAZY_PROMOTE_ENV), "{error}");
-            assert!(message.contains(&format!("{value:?}")), "{error}");
-        }
-        // `auto` promotes after one sparse gather unless every origin read
-        // is a round trip; an explicit policy applies whatever the origin.
-        let classes = [OriginLatencyClass::Low, OriginLatencyClass::High];
-        assert_eq!(
-            classes.map(|class| LazyPromotion::Auto.resolve(class)),
-            [LazyPromotion::Background { reads: 1 }, LazyPromotion::Off]
-        );
-        for policy in [LazyPromotion::Off, LazyPromotion::Background { reads: 2 }] {
-            assert_eq!(classes.map(|class| policy.resolve(class)), [policy; 2]);
-        }
-        for (policy, spelling) in [
-            (LazyPromotion::Auto, "auto"),
-            (LazyPromotion::Off, "off"),
-            (LazyPromotion::Background { reads: 2 }, "bg:2"),
-        ] {
-            assert_eq!(policy.to_string(), spelling);
-            assert_eq!(parse(spelling).unwrap(), policy);
-        }
-    }
-
-    #[test]
-    fn test_lazy_dense_to_eager_knob() {
-        let parse = |mode: &str| {
-            LayeredLazyConfig::from_lookup(|key| match key {
-                LAZY_FULL_ENV => Some("1".to_string()),
-                LAZY_DENSE_TO_EAGER_ENV => Some(mode.to_string()),
-                _ => None,
-            })
-            .map(|config| config.dense_to_eager)
-        };
-        for (value, expected) in [
-            ("off", DenseToEager::Off),
-            (" origin ", DenseToEager::Origin),
-            ("all", DenseToEager::All),
-            // The former flag's values keep their meaning.
-            ("0", DenseToEager::Off),
-            ("false", DenseToEager::Off),
-            ("1", DenseToEager::All),
-            ("true", DenseToEager::All),
-        ] {
-            assert_eq!(parse(value).unwrap(), expected, "{value:?}");
-        }
-        for mode in [DenseToEager::Off, DenseToEager::Origin, DenseToEager::All] {
-            assert_eq!(mode.to_string(), mode.as_str());
-            assert_eq!(parse(mode.as_str()).unwrap(), mode);
-        }
-        for value in ["2", "ORIGIN", "on", "auto", ""] {
-            let error = parse(value).unwrap_err();
-            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-            let message = error.to_string();
-            assert!(message.contains(LAZY_DENSE_TO_EAGER_ENV), "{error}");
-            assert!(message.contains(&format!("{value:?}")), "{error}");
-        }
-
-        // Tiers of the high and low planes of probes whose planes are not
-        // both resident: some plane on no cache tier, or every plane local.
-        let (resident, local, absent) = (CacheTier::Resident, CacheTier::Local, CacheTier::Absent);
-        let (low, high) = (OriginLatencyClass::Low, OriginLatencyClass::High);
-        let slow = [[resident, absent], [absent, local], [absent, absent]];
-        let local_only = [[resident, local], [local, resident], [local, local]];
-        for tiers in slow {
-            assert!(high.reads_slow_origin(&tiers), "{tiers:?}");
-            assert!(!low.reads_slow_origin(&tiers), "{tiers:?}");
-            assert!(DenseToEager::Origin.routes(high, &tiers), "{tiers:?}");
-            assert!(!DenseToEager::Origin.routes(low, &tiers), "{tiers:?}");
-        }
-        for tiers in local_only {
-            for class in [low, high] {
-                let context = format!("{class} {tiers:?}");
-                assert!(!class.reads_slow_origin(&tiers), "{context}");
-                assert!(!DenseToEager::Origin.routes(class, &tiers), "{context}");
-            }
-        }
-        for tiers in slow.iter().chain(&local_only) {
-            for class in [low, high] {
-                let context = format!("{class} {tiers:?}");
-                assert!(!DenseToEager::Off.routes(class, tiers), "{context}");
-                assert!(DenseToEager::All.routes(class, tiers), "{context}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_lazy_far_window_knob() {
-        let parse = |window: Option<&str>, inflight: Option<&str>| {
-            LayeredLazyConfig::from_lookup(|key| match key {
-                LAZY_FULL_ENV => Some("1".to_string()),
-                LAZY_FAR_WINDOW_ENV => window.map(String::from),
-                LAZY_FAR_INFLIGHT_ENV => inflight.map(String::from),
-                _ => None,
-            })
-        };
-        let defaults = LayeredLazyConfig::default();
-        assert_eq!((defaults.far_window, defaults.far_inflight), (64, 64));
-        let config = parse(Some(" 0 "), Some("1")).unwrap();
-        assert_eq!((config.far_window, config.far_inflight), (0, 1));
-        let most = Semaphore::MAX_PERMITS.to_string();
-        assert_eq!(
-            parse(None, Some(most.as_str())).unwrap().far_inflight,
-            Semaphore::MAX_PERMITS
-        );
-        // A pool cannot hold more permits, and a pool without any would
-        // never issue a gather beyond the ordinary window.
-        let too_many = (Semaphore::MAX_PERMITS + 1).to_string();
-        for (name, window, inflight) in [
-            (LAZY_FAR_WINDOW_ENV, Some("wide"), None),
-            (LAZY_FAR_WINDOW_ENV, Some("-1"), None),
-            (LAZY_FAR_INFLIGHT_ENV, None, Some("0")),
-            (LAZY_FAR_INFLIGHT_ENV, None, Some(too_many.as_str())),
-            (LAZY_FAR_INFLIGHT_ENV, None, Some("")),
-        ] {
-            let error = parse(window, inflight).unwrap_err();
-            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-            let message = error.to_string();
-            let value = window.or(inflight).unwrap();
-            assert!(message.contains(name), "{error}");
-            assert!(message.contains(&format!("{value:?}")), "{error}");
-        }
-
-        // The far window applies only where every origin read is a round
-        // trip, and only when wider than the ordinary window.
-        let (low, high) = (OriginLatencyClass::Low, OriginLatencyClass::High);
-        assert_eq!(defaults.active_far_window(low), None);
-        assert_eq!(defaults.active_far_window(high), Some(64));
-        for (window, far_window, expected) in [
-            (16, 17, Some(17)),
-            (16, 16, None),
-            (16, 8, None),
-            (0, usize::MAX, Some(usize::MAX)),
-        ] {
-            let config = LayeredLazyConfig {
-                window,
-                far_window,
-                ..defaults
-            };
-            let context = format!("window={window} far_window={far_window}");
-            assert_eq!(config.active_far_window(high), expected, "{context}");
-            assert_eq!(config.active_far_window(low), None, "{context}");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_lazy_far_permits_count_permits_in_flight() {
-        let error = LazyFarPermits::try_new(Semaphore::MAX_PERMITS + 1).unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-        let permits = LazyFarPermits::try_new(2).unwrap();
-        let shared = permits.clone();
-        assert_eq!((permits.size(), permits.in_flight()), (2, 0));
-        let first = permits.try_acquire().unwrap();
-        let second = shared.try_acquire().unwrap();
-        // Clones share one pool.
-        assert!(permits.try_acquire().is_none());
-        assert_eq!(shared.in_flight(), 2);
-        // A wait abandoned before a permit frees up takes none.
-        assert!(permits.acquire().now_or_never().is_none());
-        drop(first);
-        assert_eq!(permits.in_flight(), 1);
-        let third = permits.acquire().await.unwrap();
-        assert_eq!(shared.in_flight(), 2);
-        drop((second, third));
-        assert_eq!(permits.in_flight(), 0);
-    }
-
-    /// Every open of an index file draws its far gathers from one pool per
-    /// size, which lives while an open or a taken permit holds it. The same
-    /// path in another bucket is another file.
-    #[test]
-    fn test_lazy_far_permits_shared_per_index_file() {
-        let path = "t.lance/_indices/far-permits-test/auxiliary.idx";
-        let file = IndexFileKey::new("far-permits-test", "s3$bucket", path);
-        let pool = LazyFarPermits::for_file(&file, 2).unwrap();
-        let held = pool.try_acquire().unwrap();
-        let shared = LazyFarPermits::for_file(&file, 2).unwrap();
-        assert_eq!((shared.size(), shared.in_flight()), (2, 1));
-        assert_eq!(LazyFarPermits::for_file(&file, 3).unwrap().in_flight(), 0);
-        let other = IndexFileKey::new("far-permits-test", "s3$other", path);
-        assert_eq!(LazyFarPermits::for_file(&other, 2).unwrap().in_flight(), 0);
-        // The taken permit keeps the pool once no open holds it.
-        drop((pool, shared));
-        assert_eq!(LazyFarPermits::for_file(&file, 2).unwrap().in_flight(), 1);
-        drop(held);
-        assert_eq!(LazyFarPermits::for_file(&file, 2).unwrap().in_flight(), 0);
-        let error = LazyFarPermits::for_file(&file, Semaphore::MAX_PERMITS + 1).unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
     }
 
     #[test]
