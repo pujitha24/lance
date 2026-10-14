@@ -4323,6 +4323,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(metadata.query_estimator, RabitQueryEstimator::ResidualQuery);
+        assert_eq!(metadata.row_layout, RQRowLayout::Columns);
+        assert!(
+            serde_json::to_value(&metadata)
+                .unwrap()
+                .get("row_layout")
+                .is_none()
+        );
     }
 
     /// Metadata without `row_layout` is the column layout, which is never
