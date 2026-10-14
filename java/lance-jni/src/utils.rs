@@ -538,8 +538,12 @@ pub fn get_vector_index_params(
                 "getRqParams",
                 |env, rq_obj| {
                     let num_bits = env.call_method(&rq_obj, "getNumBits", "()B", &[])?.b()? as u8;
-                    let layered = env.call_method(&rq_obj, "getLayered", "()Z", &[])?.z()?;
-                    Ok(RQBuildParams::new(num_bits).with_layered(layered))
+                    let layered = env
+                        .call_method(&rq_obj, "getLayeredOption", "()Ljava/util/Optional;", &[])?
+                        .l()?;
+                    let mut params = RQBuildParams::new(num_bits);
+                    params.layered = env.get_boolean_opt(&layered)?;
+                    Ok(params)
                 },
             )?;
 

@@ -31,6 +31,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -159,8 +160,26 @@ public class JNITest {
   @Test
   public void testRqBuildParamsDefaultNumBits() {
     assertEquals((byte) 5, new RQBuildParams.Builder().build().getNumBits());
-    assertEquals(false, new RQBuildParams.Builder().build().getLayered());
-    assertEquals(true, new RQBuildParams.Builder().setLayered(true).build().getLayered());
+    assertEquals(Optional.empty(), new RQBuildParams.Builder().build().getLayeredOption());
+    assertEquals(
+        Optional.of(false),
+        new RQBuildParams.Builder().setLayered(false).build().getLayeredOption());
+    assertEquals(
+        Optional.of(true), new RQBuildParams.Builder().setLayered(true).build().getLayeredOption());
+    for (RQBuildParams params :
+        List.of(
+            new RQBuildParams.Builder().build(),
+            new RQBuildParams.Builder().setLayered(false).build(),
+            new RQBuildParams.Builder().setLayered(true).build())) {
+      JniTestHelper.parseIndexParams(
+          IndexParams.builder()
+              .setVectorIndexParams(
+                  VectorIndexParams.withIvfRqParams(
+                      DistanceType.L2,
+                      new IvfBuildParams.Builder().setNumPartitions(2).build(),
+                      params))
+              .build());
+    }
   }
 
   @Test
