@@ -5501,7 +5501,7 @@ fn format_python_error(e: PyErr, py: Python) -> PyResult<String> {
 
     let tracback_mod = py.import("traceback")?;
     let fmt_func = tracback_mod.getattr("format_exception")?;
-    let e_type = e.get_type(py).to_owned();
+    let e_type = e.get_type(py).clone();
     let formatted = fmt_func.call1((e_type, &e, traceback))?;
     let lines: Vec<String> = formatted.extract()?;
     Ok(lines.join(""))

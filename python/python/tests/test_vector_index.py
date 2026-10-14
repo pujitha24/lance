@@ -4289,22 +4289,34 @@ def test_layered_rq_precision_and_cascade(tmp_path, num_bits):
         dataset.to_table(nearest={**nearest, "rq_cascade_factor": 0})
 
 
-@pytest.mark.parametrize("num_bits", [1, 2])
-def test_layered_rq_rejects_unsupported_bits(tmp_path, num_bits):
-    vectors = np.zeros((64, 64), dtype=np.float32)
+@pytest.mark.parametrize("num_bits", [1, 2, 5])
+@pytest.mark.parametrize("layered", ["unset", None, False, True])
+def test_rq_layered_defaults(tmp_path, num_bits, layered):
+    rng = np.random.default_rng(472)
+    vectors = rng.normal(size=(128, 32)).astype(np.float32)
     dataset = lance.write_dataset(
-        pa.table(
-            {
-                "vector": pa.FixedSizeListArray.from_arrays(vectors.ravel(), 64),
-            }
-        ),
+        pa.table({"vector": pa.FixedSizeListArray.from_arrays(vectors.ravel(), 32)}),
         tmp_path,
+        max_rows_per_file=32,
     )
-    with pytest.raises(ValueError, match="requires num_bits in 3..=9"):
-        dataset.create_index(
-            "vector",
-            index_type="IVF_RQ",
-            num_bits=num_bits,
-            layered=True,
-            num_partitions=1,
-        )
+    kwargs = {} if layered == "unset" else {"layered": layered}
+    dataset.create_index(
+        "vector", index_type="IVF_RQ", num_bits=num_bits, num_partitions=2, **kwargs
+    )
+    nearest = {
+        "column": "vector",
+        "q": vectors[0],
+        "k": 10,
+        "nprobes": 2,
+        "refine_factor": 13,
+    }
+    exact = dataset.to_table(
+        columns=[], with_row_id=True, nearest={**nearest, "use_index": False}
+    )["_rowid"].to_pylist()
+    result = dataset.to_table(columns=[], with_row_id=True, nearest=nearest)
+    assert len(set(result["_rowid"].to_pylist()) & set(exact)) >= 5
+    if num_bits > 2 and layered is True:
+        assert len(dataset.to_table(nearest={**nearest, "rq_precision": "high"})) == 10
+    else:
+        with pytest.raises(ValueError, match="rq_precision"):
+            dataset.to_table(nearest={**nearest, "rq_precision": "high"})
