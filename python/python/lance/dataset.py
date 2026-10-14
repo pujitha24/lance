@@ -4540,8 +4540,11 @@ class LanceDataset(pa.dataset.Dataset):
             - num_bits
                 The number of bits for RQ (Rabit Quantization). Default is 5.
             - layered
-                Opt in to independently readable sign/high/low planes. Default is
-                False. Supports total widths 3 through 9: 3 (1+1+1), 4 (1+2+1),
+                Enable independently readable sign/high/low planes. Default is
+                None, which resolves to False in OSS and True in Enterprise.
+                An explicit boolean overrides the product default. Widths 1 and 2
+                always use the single-plane layout, even when layered is True.
+                Supports total widths 3 through 9: 3 (1+1+1), 4 (1+2+1),
                 5 (1+2+2), 6 (1+4+1), 7 (1+4+2), 8 (1+4+3), and 9 (1+4+4).
                 This layout requires a layered-capable reader.
 
