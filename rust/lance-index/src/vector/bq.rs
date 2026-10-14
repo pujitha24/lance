@@ -198,6 +198,12 @@ impl RQBuildParams {
 
     /// Write the auxiliary file in `row_layout`. Plane rows require a reader
     /// with plane-row support.
+    ///
+    /// ```
+    /// use lance_index::vector::bq::{RQBuildParams, RQRowLayout};
+    /// let params = RQBuildParams::new(5).with_row_layout(RQRowLayout::Columns);
+    /// assert_eq!(params.row_layout, RQRowLayout::Columns);
+    /// ```
     pub fn with_row_layout(mut self, row_layout: RQRowLayout) -> Self {
         self.row_layout = row_layout;
         self
@@ -314,14 +320,19 @@ mod tests {
     #[case::unset(None)]
     #[case::single_plane(Some(false))]
     #[case::layered(Some(true))]
-    fn test_rq_layered_presence_round_trip(#[case] layered: Option<bool>) {
+    fn test_rq_layered_presence_round_trip(
+        #[case] layered: Option<bool>,
+        #[values(RQRowLayout::Columns, RQRowLayout::PlaneRows)] row_layout: RQRowLayout,
+    ) {
         let params = RQBuildParams {
             layered,
+            row_layout,
             ..Default::default()
         };
         let details = RabitQuantization::from(&params);
         let decoded = RabitQuantization::decode(details.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded.layered, layered);
+        assert_eq!(decoded.row_layout, details.row_layout);
     }
 
     #[test]
