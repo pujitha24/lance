@@ -4682,7 +4682,7 @@ mod tests {
             RQRowLayout::PlaneRows => rabit_quantization::RowLayout::PlaneRows,
         };
         assert_eq!(rq.row_layout(), expected_layout);
-        assert_eq!(rq.layered, layered);
+        assert_eq!(rq.layered, Some(layered));
 
         // The index answers queries.
         let query = arrow_array::Float32Array::from(vec![0.5f32; 16]);
