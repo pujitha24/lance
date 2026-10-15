@@ -1501,13 +1501,23 @@ fn gating_off_reports_reason() {
     .unwrap_err();
     assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
     assert!(error.to_string().contains(ERROR_FACTORS_COLUMN), "{error}");
-    let error = RabitQuantizationStorage::try_from_sign_plane_for_full(
+    let native_sign = RabitQuantizationStorage::try_from_sign_plane_for_full(
         partition.sign.clone(),
         &native_metadata,
         fixture.distance_type,
     )
+    .unwrap();
+    assert!(stage_one(&fixture, &partition, &native_sign, ApproxMode::Normal).is_ok());
+    let mut one_bit_metadata = native_metadata;
+    one_bit_metadata.num_bits = 1;
+    let error = RabitQuantizationStorage::try_from_sign_plane_for_full(
+        partition.sign.clone(),
+        &one_bit_metadata,
+        fixture.distance_type,
+    )
     .unwrap_err();
-    assert!(error.to_string().contains("layered multi-bit"), "{error}");
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("multi-bit"), "{error}");
 
     // Gathered rows must match the index layout and the scan precision.
     let error = ExRows::from_plane_batches(&partition.hi, &partition.lo, fixture.rotated_dim(), 9)

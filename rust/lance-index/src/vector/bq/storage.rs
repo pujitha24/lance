@@ -640,7 +640,7 @@ pub struct RabitQuantizationStorage {
 enum PlaneScope {
     /// Every column the metadata calls for.
     All,
-    /// Only the sign plane of a layered multi-bit index; the ex planes are
+    /// Only the sign plane of a multi-bit index; the ex planes are
     /// supplied per query as [`ExRows`].
     SignOnlyForFull,
 }
@@ -1079,7 +1079,7 @@ impl RabitQuantizationStorage {
                 (super::layered::RQPrecision::Full, Some(ex)) => (
                     self.metadata.num_bits,
                     Some(ex.hi),
-                    Some(ex.lo),
+                    ex.lo,
                     ex.hi_row_bytes,
                     None,
                     Some(ex.ex_add),
@@ -1179,30 +1179,39 @@ impl RabitQuantizationStorage {
         options: DistanceCalculatorOptions,
         ex_rows: ExRows<'a>,
     ) -> Result<RabitDistCalculator<'a>> {
-        if !self.metadata.layered
-            || options.rq_precision != super::layered::RQPrecision::Full
+        if options.rq_precision != super::layered::RQPrecision::Full
             || options.approx_mode == ApproxMode::Fast
         {
             return Err(Error::invalid_input(format!(
-                "gathered ex rows require a layered full-precision gated scan, got layered={} rq_precision={:?} approx_mode={:?}",
+                "gathered ex rows require a full-precision gated scan, got layered={} rq_precision={:?} approx_mode={:?}",
                 self.metadata.layered, options.rq_precision, options.approx_mode
             )));
         }
-        let layout = super::layered::RQLayout::try_new(self.metadata.num_bits)?;
         let code_dim = self.code_dim();
-        let hi_row_bytes = blocked_ex_code_bytes(code_dim, layout.high_bits);
-        let lo_row_bytes = blocked_ex_code_bytes(code_dim, layout.low_bits);
+        let (hi_row_bytes, lo_row_bytes) = if self.metadata.layered {
+            let layout = super::layered::RQLayout::try_new(self.metadata.num_bits)?;
+            (
+                blocked_ex_code_bytes(code_dim, layout.high_bits),
+                blocked_ex_code_bytes(code_dim, layout.low_bits),
+            )
+        } else {
+            (
+                blocked_ex_code_bytes(code_dim, rabit_ex_bits(self.metadata.num_bits)?),
+                0,
+            )
+        };
         let rows = ex_rows.len();
         if ex_rows.hi_row_bytes != hi_row_bytes
             || ex_rows.hi.len() != rows * hi_row_bytes
-            || ex_rows.lo.len() != rows * lo_row_bytes
+            || ex_rows.lo.is_some() != self.metadata.layered
+            || ex_rows.lo.map_or(0, <[u8]>::len) != rows * lo_row_bytes
         {
             return Err(Error::invalid_input(format!(
                 "gathered ex rows do not match rotated_dim={code_dim} num_bits={}: {rows} rows, high plane {} bytes at {} per row (expected {hi_row_bytes}), low plane {} bytes (expected {lo_row_bytes} per row)",
                 self.metadata.num_bits,
                 ex_rows.hi.len(),
                 ex_rows.hi_row_bytes,
-                ex_rows.lo.len(),
+                ex_rows.lo.map_or(0, <[u8]>::len),
             )));
         }
         Ok(self.dist_calculator_with_scratch_and_ex(
@@ -1524,15 +1533,15 @@ struct RawQueryTopkContext<'a> {
     query_upper_bound: f32,
 }
 
-/// Full-precision ex rows gathered for the stage-2 rerank of a lazy layered
-/// scan: blocked high and low plane codes plus the full ex factors, all
+/// Full-precision ex rows gathered for a stage-2 rerank: blocked native codes
+/// or high and low plane codes, plus the full ex factors, all
 /// indexed by the survivor's ex index. Whole planes keep the sign-plane
 /// offset as the ex index; a compact gather uses the position in the gather.
 #[derive(Debug, Clone, Copy)]
 pub struct ExRows<'a> {
     hi: &'a [u8],
     hi_row_bytes: usize,
-    lo: &'a [u8],
+    lo: Option<&'a [u8]>,
     ex_add: &'a [f32],
     ex_scale: &'a [f32],
 }
@@ -1596,9 +1605,77 @@ impl<'a> ExRows<'a> {
         Ok(Self {
             hi: hi_codes.values().as_primitive::<UInt8Type>().values(),
             hi_row_bytes: hi_codes.value_length() as usize,
-            lo: lo_codes.values().as_primitive::<UInt8Type>().values(),
+            lo: Some(lo_codes.values().as_primitive::<UInt8Type>().values()),
             ex_add,
             ex_scale,
+        })
+    }
+
+    /// Borrow current native blocked ex codes and their full add/scale factors.
+    /// The absent low plane selects the same single-plane kernel as native Full.
+    /// `rotated_dim` is the padded dimension and `num_bits` is the total width
+    /// (2 through 9). Null codes or factors and mismatched widths are rejected.
+    ///
+    /// ```
+    /// # use arrow_array::RecordBatch;
+    /// # use lance_core::Result;
+    /// # use lance_index::vector::bq::storage::ExRows;
+    /// fn gathered_rows(batch: &RecordBatch) -> Result<ExRows<'_>> {
+    ///     ExRows::from_native_batch(batch, 2048, 7)
+    /// }
+    /// ```
+    pub fn from_native_batch(
+        batch: &'a RecordBatch,
+        rotated_dim: usize,
+        num_bits: u8,
+    ) -> Result<Self> {
+        let ex_bits = rabit_ex_bits(num_bits)?;
+        if ex_bits == 0 {
+            return Err(Error::invalid_input(
+                "native ex rows require num_bits greater than 1",
+            ));
+        }
+        let codes = batch
+            .column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN)
+            .and_then(|column| column.as_fixed_size_list_opt())
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "native ex rows require fixed-size-list column {RABIT_BLOCKED_EX_CODE_COLUMN}"
+                ))
+            })?;
+        let row_bytes = blocked_ex_code_bytes(rotated_dim, ex_bits);
+        if codes.value_type() != DataType::UInt8
+            || codes.value_length() as usize != row_bytes
+            || codes.null_count() != 0
+            || codes.values().null_count() != 0
+        {
+            return Err(Error::invalid_input(format!(
+                "native ex rows require {row_bytes} non-null uint8 codes per row for rotated_dim={rotated_dim}, num_bits={num_bits}"
+            )));
+        }
+        let factors = |name: &str| -> Result<&'a [f32]> {
+            let values = batch
+                .column_by_name(name)
+                .and_then(|column| column.as_primitive_opt::<Float32Type>())
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("native ex rows require float32 column {name}"))
+                })?;
+            if values.null_count() != 0 || values.len() != codes.len() {
+                return Err(Error::invalid_input(format!(
+                    "native ex rows require {} non-null {name} factors, got {} rows and {} nulls",
+                    codes.len(),
+                    values.len(),
+                    values.null_count()
+                )));
+            }
+            Ok(values.values().as_ref())
+        };
+        Ok(Self {
+            hi: codes.values().as_primitive::<UInt8Type>().values(),
+            hi_row_bytes: row_bytes,
+            lo: None,
+            ex_add: factors(EX_ADD_FACTORS_COLUMN)?,
+            ex_scale: factors(EX_SCALE_FACTORS_COLUMN)?,
         })
     }
 
@@ -3765,7 +3842,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
     }
 
     /// Load only the sign plane (row ids, packed sign codes, binary and error
-    /// factors, and the bounds columns when it holds them) of a layered
+    /// factors, and the bounds columns when it holds them) of a native or layered
     /// multi-bit partition. The result supports
     /// [`RabitDistCalculator::full_sign_stage_with_scratch`] and, with
     /// gathered rows, [`RabitQuantizationStorage::dist_calculator_with_ex_rows`];
@@ -3775,9 +3852,9 @@ impl QuantizerStorage for RabitQuantizationStorage {
         metadata: &Self::Metadata,
         distance_type: DistanceType,
     ) -> Result<Self> {
-        if !metadata.layered || metadata.num_bits <= 1 {
+        if metadata.num_bits <= 1 {
             return Err(Error::invalid_input(format!(
-                "sign-plane full-precision storage requires a layered multi-bit IVF_RQ index, got layered={} num_bits={}",
+                "sign-plane full-precision storage requires a multi-bit IVF_RQ index, got layered={} num_bits={}",
                 metadata.layered, metadata.num_bits
             )));
         }
@@ -4057,6 +4134,60 @@ mod tests {
 
     use crate::vector::bq::{RQRotationType, builder::RabitQuantizer};
     use crate::vector::quantizer::{Quantization, QuantizerStorage};
+
+    #[rstest]
+    #[case::valid_slice(7, 48, false, false, None)]
+    #[case::one_bit(1, 48, false, false, Some("greater than 1"))]
+    #[case::wrong_width(7, 40, false, false, Some("48 non-null uint8 codes"))]
+    #[case::null_code(7, 48, true, false, Some("48 non-null uint8 codes"))]
+    #[case::null_factor(7, 48, false, true, Some("non-null __add_factors_ex"))]
+    fn test_native_ex_rows_validate_sliced_batch(
+        #[case] num_bits: u8,
+        #[case] width: i32,
+        #[case] null_code: bool,
+        #[case] null_factor: bool,
+        #[case] error_text: Option<&str>,
+    ) {
+        let codes = FixedSizeListArray::try_new_from_values(
+            UInt8Array::from(
+                (0..width * 3)
+                    .map(|i| (!(null_code && i == width)).then_some(i as u8))
+                    .collect::<Vec<_>>(),
+            ),
+            width,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter([
+            (RABIT_BLOCKED_EX_CODE_COLUMN, Arc::new(codes) as ArrayRef),
+            (
+                EX_ADD_FACTORS_COLUMN,
+                Arc::new(Float32Array::from(vec![
+                    Some(1.0),
+                    (!null_factor).then_some(2.0),
+                    Some(3.0),
+                ])),
+            ),
+            (
+                EX_SCALE_FACTORS_COLUMN,
+                Arc::new(Float32Array::from(vec![4.0, 5.0, 6.0])),
+            ),
+        ])
+        .unwrap()
+        .slice(1, 1);
+        let result = ExRows::from_native_batch(&batch, 64, num_bits);
+        if let Some(error_text) = error_text {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(error_text), "{error}");
+        } else {
+            let rows = result.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows.hi, (48..96).collect::<Vec<u8>>());
+            assert_eq!(rows.ex_add, &[2.0]);
+            assert_eq!(rows.ex_scale, &[5.0]);
+            assert!(rows.lo.is_none());
+        }
+    }
 
     fn build_dist_table_not_optimized<T: ArrowFloatType>(
         sub_vec: &[T::Native],

@@ -15,6 +15,7 @@
 //! v2 ex plane  : [plane: u8][rows: u64 LE][width: u32 LE][rows]
 //! v3 sign      : [plane: u8 = 0, or 3 for the bounds plane][raw body]
 //! v3 ex plane  : [plane: u8][factor_columns: u8][rows: u64 LE][width: u32 LE][rows]
+//! v4          : v3 bodies, plus native ex tag 4 with native full factors
 //! ex-plane row : [codes: width bytes][add: f32 LE][scale: f32 LE]  2 factor columns
 //!                [codes: width bytes]                              0 factor columns
 //! ```
@@ -39,6 +40,7 @@ use lance_core::{Error, Result};
 use super::layered::{PlaneBatch, SIGN_BOUNDS_PLANE, SignBounds, plane_columns};
 use super::raw_body::{read_raw_batch, write_raw_batch};
 use super::storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_BLOCKED_EX_CODE_LO_COLUMN};
+use super::transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN};
 
 /// Body layouts of the plane entry versions this build reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +53,9 @@ enum BodyVersion {
     /// Ex planes as rows with 0 or 2 factor columns behind a 14-byte header;
     /// the sign and bounds planes as a tagged raw body.
     RowsRawSign = 3,
+    /// Native ex codes have their own tag so full factors cannot be mistaken
+    /// for layered high factors. Earlier versions retain their read behavior.
+    NativeExRows = 4,
 }
 
 impl BodyVersion {
@@ -59,6 +64,7 @@ impl BodyVersion {
             1 => Ok(Self::Ipc),
             2 => Ok(Self::RowsIpcSign),
             3 => Ok(Self::RowsRawSign),
+            4 => Ok(Self::NativeExRows),
             _ => Err(Error::invalid_input(format!(
                 "unsupported plane cache version {version}"
             ))),
@@ -72,7 +78,7 @@ impl BodyVersion {
                 "plane cache version has no row directory",
             )),
             Self::RowsIpcSign => Ok(V2_HEADER_BYTES),
-            Self::RowsRawSign => Ok(V3_HEADER_BYTES),
+            Self::RowsRawSign | Self::NativeExRows => Ok(V3_HEADER_BYTES),
         }
     }
 }
@@ -83,6 +89,20 @@ const V3_HEADER_BYTES: usize = 14;
 const EX_FACTOR_COLUMNS: u8 = 2;
 const FACTOR_BYTES: usize = size_of::<f32>();
 const COALESCE_GAP_BYTES: usize = 4096;
+/// Body tag for the native ex plane. Its cache key still uses physical plane 1.
+const NATIVE_EX_PLANE_TAG: u8 = 4;
+
+fn cached_plane_columns(plane: u8) -> &'static [&'static str] {
+    if plane == NATIVE_EX_PLANE_TAG {
+        &[
+            RABIT_BLOCKED_EX_CODE_COLUMN,
+            EX_ADD_FACTORS_COLUMN,
+            EX_SCALE_FACTORS_COLUMN,
+        ]
+    } else {
+        plane_columns(plane, SignBounds::default())
+    }
+}
 
 struct Header {
     plane: u8,
@@ -102,11 +122,13 @@ impl Header {
         // v3 adds the factor column count after the plane; v2 rows always
         // carry both factors.
         let (factor_columns, fields) = match version {
-            BodyVersion::RowsRawSign => (header[1], &header[2..]),
+            BodyVersion::RowsRawSign | BodyVersion::NativeExRows => (header[1], &header[2..]),
             _ => (EX_FACTOR_COLUMNS, &header[1..]),
         };
         let plane = header[0];
-        if !matches!(plane, 1 | 2) || !matches!(factor_columns, 0 | EX_FACTOR_COLUMNS) {
+        let supported_plane = matches!(plane, 1 | 2)
+            || (version == BodyVersion::NativeExRows && plane == NATIVE_EX_PLANE_TAG);
+        if !supported_plane || !matches!(factor_columns, 0 | EX_FACTOR_COLUMNS) {
             return Err(invalid());
         }
         let (rows, width) = fields.split_at(size_of::<u64>());
@@ -131,7 +153,7 @@ impl Header {
 
     fn batch(&self, codes: Vec<u8>, adds: Vec<f32>, scales: Vec<f32>) -> Result<PlaneBatch> {
         // Ex planes hold the same columns under either bounds placement.
-        let names = plane_columns(self.plane, SignBounds::default());
+        let names = cached_plane_columns(self.plane);
         let codes =
             FixedSizeListArray::try_new_from_values(UInt8Array::from(codes), self.width as i32)?;
         let mut fields = vec![Field::new(names[0], codes.data_type().clone(), true)];
@@ -189,8 +211,9 @@ fn le_f32(bytes: &[u8]) -> f32 {
     f32::from_le_bytes(value)
 }
 
-/// The ex plane (1 or 2) whose codes `batch` holds, or `None` for the sign
-/// and bounds planes.
+/// The serialized ex-plane kind, or `None` for sign and bounds entries.
+/// Code-only native and high entries have identical schemas; full native
+/// entries need a distinct tag to preserve their full factor column names.
 fn ex_plane(batch: &RecordBatch) -> Option<u8> {
     if batch
         .column_by_name(RABIT_BLOCKED_EX_CODE_LO_COLUMN)
@@ -198,7 +221,15 @@ fn ex_plane(batch: &RecordBatch) -> Option<u8> {
     {
         Some(2)
     } else if batch.column_by_name(RABIT_BLOCKED_EX_CODE_COLUMN).is_some() {
-        Some(1)
+        Some(
+            if batch.column_by_name(EX_ADD_FACTORS_COLUMN).is_some()
+                || batch.column_by_name(EX_SCALE_FACTORS_COLUMN).is_some()
+            {
+                NATIVE_EX_PLANE_TAG
+            } else {
+                1
+            },
+        )
     } else {
         None
     }
@@ -244,7 +275,7 @@ impl PlaneBatch {
     /// Write an ex plane as rows. Its factor columns are both present (2) or
     /// both absent (0).
     fn serialize_ex_plane(&self, plane: u8, writer: &mut CacheEntryWriter<'_>) -> Result<()> {
-        let names = plane_columns(plane, SignBounds::default());
+        let names = cached_plane_columns(plane);
         let batch = &self.0;
         let codes = batch
             .column_by_name(names[0])
@@ -310,7 +341,7 @@ impl PlaneBatch {
 
 impl CacheCodecImpl for PlaneBatch {
     const TYPE_ID: &'static str = "lance.vector.rq.plane";
-    const CURRENT_VERSION: u32 = BodyVersion::RowsRawSign as u32;
+    const CURRENT_VERSION: u32 = BodyVersion::NativeExRows as u32;
     const SUPPORTS_ROW_SELECTION: bool = true;
 
     fn serialize(&self, writer: &mut CacheEntryWriter<'_>) -> Result<()> {
@@ -332,7 +363,7 @@ impl CacheCodecImpl for PlaneBatch {
                 reader.read_u8()?;
                 Ok(Self(reader.read_ipc()?))
             }
-            (BodyVersion::RowsRawSign, Some(0 | SIGN_BOUNDS_PLANE)) => {
+            (BodyVersion::RowsRawSign | BodyVersion::NativeExRows, Some(0 | SIGN_BOUNDS_PLANE)) => {
                 reader.read_u8()?;
                 Ok(Self(read_raw_batch(reader)?))
             }
@@ -443,6 +474,7 @@ mod tests {
     };
     use crate::vector::bq::raw_body::RAW_BODY_KIND;
     use crate::vector::bq::storage::RABIT_CODE_COLUMN;
+    use crate::vector::bq::transform::{EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN};
     use arrow_array::{ArrayRef, UInt64Array};
     use bytes::Bytes;
     use lance_arrow::RecordBatchExt;
@@ -587,6 +619,47 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::codes(false)]
+    #[case::all(true)]
+    fn native_ex_plane_round_trip_preserves_factors(#[case] with_factors: bool) {
+        let columns = ex_plane_batch(1, 40, 56, if with_factors { 2 } else { 0 });
+        let mut native_columns = vec![(RABIT_BLOCKED_EX_CODE_COLUMN, columns.column(0).clone())];
+        if with_factors {
+            native_columns.push((EX_ADD_FACTORS_COLUMN, columns.column(1).clone()));
+            native_columns.push((EX_SCALE_FACTORS_COLUMN, columns.column(2).clone()));
+        }
+        let fields: Vec<_> = native_columns
+            .iter()
+            .map(|(name, values)| Field::new(*name, values.data_type().clone(), true))
+            .collect();
+        let original = RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            native_columns
+                .into_iter()
+                .map(|(_, values)| values)
+                .collect(),
+        )
+        .unwrap();
+        let codec = CacheCodec::from_impl::<PlaneBatch>();
+        let encoded = encode(&codec, &original);
+        let CacheDecode::Hit(restored) = decode(&codec, &encoded) else {
+            panic!("native whole-plane cache entry did not decode")
+        };
+        assert_eq!(restored, original);
+        for rows in [vec![], vec![0], vec![0, 17, 39], (0..40).collect()] {
+            let CacheDecode::Hit(selected) = decode_rows(&codec, &encoded, &rows) else {
+                panic!("native sparse cache entry did not decode")
+            };
+            assert_eq!(
+                selected,
+                original
+                    .take(&arrow_array::UInt32Array::from(rows))
+                    .unwrap()
+            );
         }
     }
 

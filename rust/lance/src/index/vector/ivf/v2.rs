@@ -102,7 +102,7 @@ use super::{IvfIndexPartitionStatistics, IvfIndexStatistics, maybe_centroids_for
 
 pub mod rabit_scan;
 
-use rabit_scan::{RabitScan, RabitScanContext, RabitScanFactory};
+use rabit_scan::{RabitCacheLayout, RabitScan, RabitScanContext, RabitScanFactory};
 pub mod row_layout;
 
 pub(crate) type RabitSearchCacheCell = Arc<Mutex<Option<Option<Arc<RabitSearchCache>>>>>;
@@ -1739,7 +1739,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             context.file_cache.as_ref(),
             context.resident_columns,
         )?;
-        let rabit_scan = if storage.is_layered_rq() {
+        let rabit_scan = if storage.supports_rabit_planes() {
             context
                 .rabit_scan_factory
                 .as_ref()
@@ -2601,7 +2601,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         precision: lance_index::vector::bq::layered::RQPrecision,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<PartitionEntry<S, Q>>> {
-        if !self.storage.is_layered_rq() {
+        if !self.uses_rabit_plane_cache() {
             if precision != lance_index::vector::bq::layered::RQPrecision::Full {
                 return Err(Error::invalid_input(
                     "rq_precision requires a layered IVF_RQ index",
@@ -2617,6 +2617,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .await?;
         entry.cache_whole_partition = false;
         Ok(Arc::new(entry))
+    }
+
+    /// A strategy's native plane cache must also serve prewarm and eager
+    /// fallback; otherwise the scan would bypass already-warmed partitions.
+    fn uses_rabit_plane_cache(&self) -> bool {
+        self.storage.is_layered_rq()
+            || self
+                .rabit_scan
+                .as_ref()
+                .is_some_and(|scan| scan.cache_layout() == RabitCacheLayout::Planes)
     }
 
     async fn load_partition_entry(
@@ -2651,7 +2661,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .await?;
         let idx = S::load(batch)?;
         let storage = if let Some(precision) = precision {
-            Box::pin(self.storage.load_partition_at_precision(
+            Box::pin(self.storage.load_rabit_partition_planes(
                 partition_id,
                 precision,
                 &self.index_cache,
@@ -3066,7 +3076,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             "IVF_RQ index {} prewarms with a resident store its open did not load",
             self.uuid
         );
-        if self.storage.is_layered_rq() {
+        if self.uses_rabit_plane_cache() {
             self.storage.prewarm_planes(&self.index_cache).await?;
         } else {
             self.prewarm_partitions().await?;
@@ -4123,7 +4133,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         context.resident_columns,
     )?;
     let io_stats = context.io_stats.clone();
-    let rabit_scan = if storage.is_layered_rq() {
+    let rabit_scan = if storage.supports_rabit_planes() {
         context
             .rabit_scan_factory
             .as_ref()
@@ -8365,6 +8375,7 @@ mod tests {
     /// Layered storage, cache lifetime and scan extension integration.
     mod layered_storage {
         use super::*;
+        use crate::index::vector::ivf::v2::rabit_scan::RabitCacheLayout;
         use crate::io::exec::utils::IndexMetrics;
         use async_trait::async_trait;
         use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -9026,6 +9037,7 @@ mod tests {
             opens: Arc<AtomicUsize>,
             searches: Arc<AtomicUsize>,
             behavior: TestScanBehavior,
+            cache_layout: RabitCacheLayout,
         }
 
         #[derive(Debug, Clone, Copy)]
@@ -9051,6 +9063,10 @@ mod tests {
 
         #[async_trait]
         impl super::super::rabit_scan::RabitScan for RecordingScanFactory {
+            fn cache_layout(&self) -> RabitCacheLayout {
+                self.cache_layout
+            }
+
             async fn search(
                 &self,
                 _context: Arc<super::super::rabit_scan::RabitScanContext>,
@@ -9071,6 +9087,9 @@ mod tests {
         #[tokio::test]
         async fn test_rabit_scan_factory_rebinds_from_current_session(
             #[case] behavior: TestScanBehavior,
+            #[values(true, false)] layered: bool,
+            #[values(RabitCacheLayout::Partition, RabitCacheLayout::Planes)]
+            cache_layout: RabitCacheLayout,
         ) {
             let batch = gen_batch()
                 .with_seed(Seed::from(42))
@@ -9088,7 +9107,7 @@ mod tests {
             let params = VectorIndexParams::with_ivf_rq_params(
                 DistanceType::L2,
                 IvfBuildParams::try_with_centroids(4, centroids).unwrap(),
-                RQBuildParams::new(7).with_layered(true),
+                RQBuildParams::new(7).with_layered(layered),
             );
             dataset
                 .create_index(&["vector"], IndexType::Vector, None, &params, true)
@@ -9111,6 +9130,7 @@ mod tests {
                 opens: Arc::default(),
                 searches: Arc::default(),
                 behavior: TestScanBehavior::Full,
+                cache_layout,
             });
             let installed = open_with_session(
                 dir.as_str(),
@@ -9123,6 +9143,10 @@ mod tests {
                     .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
                     .await
                     .unwrap();
+                assert_eq!(
+                    lazy_index(&index).uses_rabit_plane_cache(),
+                    layered || cache_layout == RabitCacheLayout::Planes
+                );
                 let result = search_global(&index, &query, Arc::new(NoFilter))
                     .await
                     .unwrap();
@@ -9147,6 +9171,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(lazy_index(&index).rabit_scan.is_none());
+            assert_eq!(lazy_index(&index).uses_rabit_plane_cache(), layered);
             assert_eq!(
                 result_bits(
                     &search_global(&index, &query, Arc::new(NoFilter))
@@ -9157,8 +9182,13 @@ mod tests {
             );
             assert_eq!(original.searches.load(Ordering::Relaxed), 2);
 
+            let replacement_layout = match cache_layout {
+                RabitCacheLayout::Partition => RabitCacheLayout::Planes,
+                RabitCacheLayout::Planes => RabitCacheLayout::Partition,
+            };
             let replacement = Arc::new(RecordingScanFactory {
                 behavior,
+                cache_layout: replacement_layout,
                 opens: Arc::default(),
                 searches: Arc::default(),
             });
@@ -9181,7 +9211,12 @@ mod tests {
                 );
                 return;
             }
-            let result = search_global(&opened.unwrap(), &query, Arc::new(NoFilter)).await;
+            let opened = opened.unwrap();
+            assert_eq!(
+                lazy_index(&opened).uses_rabit_plane_cache(),
+                layered || replacement_layout == RabitCacheLayout::Planes
+            );
+            let result = search_global(&opened, &query, Arc::new(NoFilter)).await;
             assert_eq!(replacement.searches.load(Ordering::Relaxed), 1);
             match behavior {
                 TestScanBehavior::Full => assert_eq!(result_bits(&result.unwrap()), expected),

@@ -6,7 +6,6 @@
 use crate::vector::bq::ex_dot::blocked_ex_code_bytes;
 use crate::vector::bq::layered::{
     EntryColumns, PlaneBatch, PlaneKey, RQLayout, SIGN_BOUNDS_PLANE, SignBounds, plane_columns,
-    plane_entry_columns,
 };
 use crate::vector::bq::layered_stats;
 use crate::vector::bq::partition_codes::{PartitionCodes, PartitionCodesKey};
@@ -14,8 +13,12 @@ use crate::vector::bq::plane_rows::{PACKED_COLUMNS, PlaneRowsSpec};
 use crate::vector::bq::resident::{
     ResidentColumnStore, ResidentLoadTrigger, ResidentRows, is_resident,
 };
-use crate::vector::bq::storage::{RQRowLayout, normalize_entry_codes};
-use crate::vector::bq::transform::ERROR_FACTORS_COLUMN;
+use crate::vector::bq::storage::{
+    RABIT_BLOCKED_EX_CODE_COLUMN, RQRowLayout, RabitQueryEstimator, normalize_entry_codes,
+};
+use crate::vector::bq::transform::{
+    ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
+};
 use crate::vector::quantizer::{QuantizationMetadata, QuantizationType, QuantizerStorage};
 use arrow::compute::concat_batches;
 use arrow_array::{
@@ -1199,6 +1202,44 @@ pub struct LayeredExLayout {
     pub row_bytes: [usize; 2],
 }
 
+/// Physical ex-code planes available to a session-provided RaBitQ scan.
+/// Native indices have one plane containing all `num_bits - 1` ex bits;
+/// layered indices have the existing high and low planes.
+///
+/// ```
+/// use lance_index::vector::storage::RabitExLayout;
+/// let layout = RabitExLayout::Native {
+///     rotated_dim: 2048, num_bits: 7, row_bytes: 1536,
+/// };
+/// assert_eq!(layout.planes().collect::<Vec<_>>(), vec![(1, 1536)]);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RabitExLayout {
+    /// Current blocked native storage. The sign plane is independent of this plane.
+    Native {
+        /// Padded vector dimension used by the quantizer.
+        rotated_dim: usize,
+        /// Total quantization width, including the sign bit (2 through 9).
+        num_bits: u8,
+        /// Bytes per persistent-cache row, respecting code-only entries.
+        row_bytes: usize,
+    },
+    /// The existing layered high/low layout.
+    Layered(LayeredExLayout),
+}
+
+impl RabitExLayout {
+    /// Existing ex-plane identifiers and their cache row strides, in file order.
+    /// No absent plane is yielded for native storage.
+    pub fn planes(self) -> impl Iterator<Item = (u8, usize)> {
+        let (rows, count) = match self {
+            Self::Native { row_bytes, .. } => ([row_bytes, 0], 1),
+            Self::Layered(layout) => (layout.row_bytes, 2),
+        };
+        [(1, rows[0]), (2, rows[1])].into_iter().take(count)
+    }
+}
+
 /// `batch` as the cache entry of a plane. An entry holds buffers of its own:
 /// one viewing the resident store would keep the store column's whole
 /// allocation alive from the cache, charged its rows alone, so every loader
@@ -1239,6 +1280,44 @@ pub struct GatheredEx {
     pub sources: [Option<PlaneSource>; 2],
     /// Planes whose sparse rows came from the origin file.
     pub origin_row_reads: usize,
+}
+
+/// Gathered full-precision ex codes, preserving the index's physical layout.
+#[derive(Debug)]
+pub enum GatheredRabitEx {
+    /// One native ex-code batch, including its full add/scale factors.
+    Native {
+        /// Whole-partition or compact ex rows, as identified by `index`.
+        batch: RecordBatch,
+        /// Whether row offsets address the partition or the compact gather.
+        index: ExIndex,
+        /// Source of the ex rows; absent for an empty gather.
+        source: Option<PlaneSource>,
+        /// Number of sparse reads served by the origin file.
+        origin_row_reads: usize,
+    },
+    /// Existing high/low batches of a layered index.
+    Layered(GatheredEx),
+}
+
+impl GatheredRabitEx {
+    /// Sources for plane 1 and plane 2. Native indices never have a plane 2.
+    pub fn sources(&self) -> [Option<PlaneSource>; 2] {
+        match self {
+            Self::Native { source, .. } => [*source, None],
+            Self::Layered(gathered) => gathered.sources,
+        }
+    }
+
+    /// Number of sparse plane reads served by the origin file.
+    pub fn origin_row_reads(&self) -> usize {
+        match self {
+            Self::Native {
+                origin_row_reads, ..
+            } => *origin_row_reads,
+            Self::Layered(gathered) => gathered.origin_row_reads,
+        }
+    }
 }
 
 /// One ex plane fetched for a gather.
@@ -2139,6 +2218,55 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         matches!(self.quantizer(), Ok(Quantizer::Rabit(rq)) if rq.metadata_ref().layered)
     }
 
+    /// Whether this file exposes the current RaBitQ sign/ex plane primitives.
+    /// Historical native encodings and one-bit indices keep their ordinary
+    /// partition reader; they are not adapted into the new scan path.
+    pub fn supports_rabit_planes(&self) -> bool {
+        let Ok(Quantizer::Rabit(rq)) = self.quantizer() else {
+            return false;
+        };
+        let metadata = rq.metadata_ref();
+        metadata.layered
+            || ((2..=9).contains(&metadata.num_bits)
+                && metadata.packed
+                && metadata.query_estimator == RabitQueryEstimator::RawQuery
+                && self
+                    .reader
+                    .schema()
+                    .field(RABIT_BLOCKED_EX_CODE_COLUMN)
+                    .is_some()
+                && self.reader.schema().field(ERROR_FACTORS_COLUMN).is_some())
+    }
+
+    /// Project a real plane of this file, without inventing a native low plane.
+    fn rabit_plane_columns(&self, plane: u8) -> Result<&'static [&'static str]> {
+        let columns = if self.is_layered_rq() {
+            plane_columns(plane, self.sign_bounds)
+        } else if self.supports_rabit_planes() {
+            match plane {
+                0 => plane_columns(0, SignBounds::Lazy),
+                1 => &[
+                    RABIT_BLOCKED_EX_CODE_COLUMN,
+                    EX_ADD_FACTORS_COLUMN,
+                    EX_SCALE_FACTORS_COLUMN,
+                ],
+                _ => &[],
+            }
+        } else {
+            return Err(Error::invalid_input(
+                "RaBitQ plane reads require layered or current blocked native multi-bit storage",
+            ));
+        };
+        if columns.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "RaBitQ storage has no plane {plane} (layered={}, sign_bounds={})",
+                self.is_layered_rq(),
+                self.sign_bounds
+            )));
+        }
+        Ok(columns)
+    }
+
     /// The planes a layered partition load at `precision` reads besides the
     /// sign plane, in the order the eager bounds placement assembles its
     /// columns: the bounds plane when the scan prunes with the bounds and the
@@ -2147,6 +2275,14 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// with the error factors, or with the full bounds on a file without them.
     fn planes_after_sign(&self, precision: super::bq::layered::RQPrecision) -> Result<Vec<u8>> {
         use super::bq::layered::RQPrecision;
+        if !self.is_layered_rq() {
+            if precision != RQPrecision::Full || !self.supports_rabit_planes() {
+                return Err(Error::invalid_input(
+                    "native RaBitQ plane reads require current multi-bit storage at full precision",
+                ));
+            }
+            return Ok(vec![1]);
+        }
         let has_error_factors = match self.plane_rows()? {
             Some(spec) => spec
                 .logical_schema()
@@ -2184,6 +2320,20 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             }
             return self.load_partition(part_id, io_stats).await;
         }
+        self.load_rabit_partition_planes(part_id, precision, cache, io_stats)
+            .await
+    }
+
+    /// Read an entire native or layered partition through its sign/ex entries.
+    /// This is a storage primitive for explicitly installed scan strategies;
+    /// ordinary native scans keep using the partition cache.
+    pub async fn load_rabit_partition_planes(
+        &self,
+        part_id: usize,
+        precision: super::bq::layered::RQPrecision,
+        cache: &WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<Q::Storage> {
         let after_sign = self.planes_after_sign(precision)?;
         let load_plane = |plane| self.load_plane(part_id, plane, cache, io_stats.clone());
         let planes = if sequential_plane_loads()? || cache.plane_admission_gated() {
@@ -2299,7 +2449,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// What the cache entry of plane `plane` of `part_id` holds, read from
     /// the file: the whole plane ([`Self::read_plane`]) or, under
     /// [`EntryColumns::Codes`], only its file columns
-    /// ([`plane_entry_columns`]), with the sign codes packed. Every loader
+    /// (the plane's non-resident columns), with the sign codes packed. Every loader
     /// of a plane entry reads it here.
     pub async fn read_plane_entry(
         &self,
@@ -2326,13 +2476,12 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         if entry_columns == EntryColumns::All {
             return self.read_plane(part_id, plane, None, io_stats).await;
         }
-        let columns = plane_entry_columns(plane, self.sign_bounds, entry_columns);
-        if columns.is_empty() {
-            return Err(Error::invalid_input(format!(
-                "a layered partition has no plane {plane} with {} bounds",
-                self.sign_bounds
-            )));
-        }
+        let columns: Vec<_> = self
+            .rabit_plane_columns(plane)?
+            .iter()
+            .copied()
+            .filter(|name| super::bq::resident::is_file_column(name))
+            .collect();
         let batch = if self.plane_rows()?.is_some() {
             // The entry's columns are packed with the plane's others.
             let plane = self.read_plane(part_id, plane, None, io_stats).await?;
@@ -2352,7 +2501,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let projection = lance_file::versions::reader_projection_from_column_names(
                 self.reader.metadata().version(),
                 self.reader.schema(),
-                plane_columns(plane, self.sign_bounds),
+                self.rabit_plane_columns(plane)?,
             )?;
             Ok(Arc::new(arrow_schema::Schema::from(
                 projection.schema.as_ref(),
@@ -2445,6 +2594,35 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             num_bits: metadata.num_bits,
             row_bytes: [layout.high_bits, layout.low_bits]
                 .map(|bits| blocked_ex_code_bytes(rotated_dim, bits) + EX_PLANE_FACTOR_BYTES),
+        })
+    }
+
+    /// Geometry of the physical ex planes available to a session scan.
+    pub fn rabit_ex_layout(&self) -> Result<RabitExLayout> {
+        if self.is_layered_rq() {
+            return self.layered_ex_layout().map(RabitExLayout::Layered);
+        }
+        if !self.supports_rabit_planes() {
+            return Err(Error::invalid_input(
+                "native ex-plane layout requires current blocked multi-bit RaBitQ storage",
+            ));
+        }
+        let Quantizer::Rabit(rq) = self.quantizer()? else {
+            return Err(Error::invalid_input(
+                "ex-plane layout requires RaBitQ storage",
+            ));
+        };
+        let metadata = rq.metadata_ref();
+        let rotated_dim = metadata.rotated_dim();
+        let factors = if self.entry_columns() == EntryColumns::All {
+            EX_PLANE_FACTOR_BYTES
+        } else {
+            0
+        };
+        Ok(RabitExLayout::Native {
+            rotated_dim,
+            num_bits: metadata.num_bits,
+            row_bytes: blocked_ex_code_bytes(rotated_dim, metadata.num_bits - 1) + factors,
         })
     }
 
@@ -2546,6 +2724,68 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             index,
             sources: [Some(high.source), Some(low.source)],
             origin_row_reads: usize::from(high.from_origin) + usize::from(low.from_origin),
+        })
+    }
+
+    /// Gather full-precision ex rows from the index's actual physical planes.
+    /// Native storage consumes only slot 0 of `plan`; layered storage preserves
+    /// [`Self::gather_ex_rows`]'s high/low behavior. Empty gathers perform no I/O.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn gather_rabit_ex_rows(
+        &self,
+        part_id: usize,
+        rows: &[u32],
+        plan: GatherPlan,
+        coalesce_gap: Option<u64>,
+        cache: &WeakLanceCache,
+        io_stats: Option<IoStats>,
+    ) -> Result<GatheredRabitEx> {
+        if self.is_layered_rq() {
+            return self
+                .gather_ex_rows(part_id, rows, plan, coalesce_gap, cache, io_stats)
+                .await
+                .map(GatheredRabitEx::Layered);
+        }
+        self.rabit_ex_layout()?;
+        let partition_rows = self.partition_size(part_id);
+        if rows.windows(2).any(|pair| pair[0] >= pair[1])
+            || rows
+                .last()
+                .is_some_and(|&row| row as usize >= partition_rows)
+        {
+            return Err(Error::invalid_input(format!(
+                "gathered offsets of partition {part_id} must be sorted, unique and below its {partition_rows} rows"
+            )));
+        }
+        if rows.is_empty() {
+            return Ok(GatheredRabitEx::Native {
+                batch: self.read_plane(part_id, 1, Some(Vec::new()), None).await?,
+                index: ExIndex::Compact,
+                source: None,
+                origin_row_reads: 0,
+            });
+        }
+        let fetched = self
+            .fetch_ex_plane(
+                part_id,
+                1,
+                rows,
+                plan.planes[0],
+                plan.origin_whole[0],
+                coalesce_gap,
+                cache,
+                io_stats,
+            )
+            .await?;
+        Ok(GatheredRabitEx::Native {
+            batch: fetched.batch,
+            index: if fetched.source == PlaneSource::Sparse {
+                ExIndex::Compact
+            } else {
+                ExIndex::Identity
+            },
+            source: Some(fetched.source),
+            origin_row_reads: usize::from(fetched.from_origin),
         })
     }
 
@@ -2892,13 +3132,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         read_stats: Option<&IoStats>,
         load_stats: Option<&IoStats>,
     ) -> Result<RecordBatch> {
-        let columns = super::bq::layered::plane_columns(plane, self.sign_bounds);
-        if columns.is_empty() {
-            return Err(Error::invalid_input(format!(
-                "a layered partition has no plane {plane} with {} bounds",
-                self.sign_bounds
-            )));
-        }
+        let columns = self.rabit_plane_columns(plane)?;
         let (projection, schema) = self.read_projection(columns)?;
         let range = self.ivf.row_range(part_id);
         if range.is_empty() || rows.as_ref().is_some_and(Vec::is_empty) {
